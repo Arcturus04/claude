@@ -13,7 +13,7 @@ import logging
 import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 from contextlib import asynccontextmanager
 
 import yfinance as yf
@@ -27,6 +27,11 @@ from models import FeatureEngine, DNNPredictor, RNNPredictor, DQLAgent, Ensemble
 from sentiment_scraper import SentimentScraper
 from claude_analyst import ClaudeAnalyst
 from backtester import VectorizedBacktester, EventBacktester, generate_model_signals
+from igon_screener import (
+    score_stock, calculate_position_size, calculate_exit_schedule,
+    portfolio_cleanup_check, screen_from_fundamentals, generate_igon_signals,
+    IGON_METHOD_SUMMARY,
+)
 
 # ─── Configuration ────────────────────────────────────────────
 load_dotenv()
@@ -526,6 +531,117 @@ async def run_backtest(req: BacktestRequest):
 
     except Exception as e:
         raise HTTPException(500, str(e))
+
+
+# ─── IGON VALUE SCREENER ─────────────────────────────────────
+
+class IgonScreenRequest(BaseModel):
+    symbol: str = "TTE.PA"  # Default to Total Energies (Paris)
+
+
+class IgonScoreRequest(BaseModel):
+    pe: float = 8.0
+    roe: float = 15.0
+    revenue_growth: float = 5.0
+    wcr_pct: Optional[float] = None
+
+
+class IgonPositionRequest(BaseModel):
+    portfolio_value: float = 100000.0
+    stock_price: float = 50.0
+    avg_daily_volume: float = 500000.0
+    current_lines: int = 20
+
+
+class IgonExitRequest(BaseModel):
+    pe: float = 16.0
+    position_pct: float = 3.0
+
+
+@app.get("/api/igon/method")
+async def igon_method():
+    """Get a summary of William Igon's investment methodology."""
+    return IGON_METHOD_SUMMARY
+
+
+@app.post("/api/igon/screen")
+async def igon_screen(req: IgonScreenRequest):
+    """
+    Screen a stock using Igon's value criteria.
+    Fetches fundamentals from Yahoo Finance and runs the full analysis.
+    """
+    try:
+        ticker = yf.Ticker(req.symbol)
+        info = ticker.info
+
+        if not info or not info.get("shortName"):
+            raise HTTPException(404, f"No fundamental data found for {req.symbol}")
+
+        result = screen_from_fundamentals(info)
+        result["symbol"] = req.symbol
+        result["timestamp"] = datetime.now().isoformat()
+
+        # Add current price for context
+        hist = ticker.history(period="5d")
+        if not hist.empty:
+            result["current_price"] = round(float(hist["Close"].iloc[-1]), 2)
+
+        return result
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"Screening failed: {str(e)}")
+
+
+@app.post("/api/igon/score")
+async def igon_score(req: IgonScoreRequest):
+    """Score a stock using manual PE, ROE, and revenue growth inputs."""
+    return score_stock(req.pe, req.roe, req.revenue_growth, req.wcr_pct)
+
+
+@app.post("/api/igon/position-size")
+async def igon_position_size(req: IgonPositionRequest):
+    """Calculate position sizing using Igon's rules."""
+    return calculate_position_size(
+        req.portfolio_value, req.stock_price,
+        req.avg_daily_volume, req.current_lines,
+    )
+
+
+@app.post("/api/igon/exit-schedule")
+async def igon_exit_schedule(req: IgonExitRequest):
+    """Calculate profit-taking schedule based on PE expansion."""
+    return calculate_exit_schedule(req.pe, req.position_pct)
+
+
+@app.post("/api/igon/batch-screen")
+async def igon_batch_screen(symbols: List[str] = ["TTE.PA", "SAF.PA", "PUB.PA", "VIE.PA"]):
+    """Screen multiple stocks at once using Igon's criteria."""
+    results = []
+    for sym in symbols[:20]:  # Cap at 20 to avoid rate limits
+        try:
+            ticker = yf.Ticker(sym)
+            info = ticker.info
+            if info and info.get("shortName"):
+                result = screen_from_fundamentals(info)
+                result["symbol"] = sym
+                results.append(result)
+        except Exception as e:
+            logger.warning(f"Failed to screen {sym}: {e}")
+            results.append({"symbol": sym, "error": str(e)})
+
+    # Sort by score descending
+    screened = [r for r in results if "score" in r]
+    screened.sort(key=lambda r: r["score"], reverse=True)
+    errors = [r for r in results if "error" in r]
+
+    return {
+        "timestamp": datetime.now().isoformat(),
+        "total_screened": len(screened),
+        "passing_igon_screen": len([r for r in screened if r.get("passes_igon_screen")]),
+        "results": screened + errors,
+    }
 
 
 # ═══════════════════════════════════════════════════════════════

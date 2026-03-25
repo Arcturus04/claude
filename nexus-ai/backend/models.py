@@ -10,7 +10,7 @@ import numpy as np
 import pandas as pd
 import logging
 from datetime import datetime
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Optional, Tuple
 from collections import deque
 import random
 import json
@@ -449,12 +449,13 @@ class EnsemblePredictor:
 
     def __init__(self):
         self.name = "Ensemble α"
-        self.weights = {"dnn": 0.35, "rnn": 0.35, "dql": 0.30}
+        self.weights = {"dnn": 0.30, "rnn": 0.30, "dql": 0.25, "igon": 0.15}
 
     def predict(self, dnn_signal: Tuple, rnn_signal: Tuple,
-                dql_signal: Dict) -> Dict:
+                dql_signal: Dict, igon_signal: Optional[Dict] = None) -> Dict:
         """
         Combine model outputs into a unified signal.
+        Includes Igon value screen when fundamental data is available.
         """
         # Convert all to direction scores [-1, 1]
         dnn_dir = (dnn_signal[0] * 2 - 1) * dnn_signal[1]   # direction * confidence
@@ -464,12 +465,30 @@ class EnsemblePredictor:
         dql_dir = (1 if dql_action == "BUY" else -1 if dql_action == "SELL" else 0)
         dql_dir *= dql_signal["confidence"]
 
+        # Igon value signal: map score (0-100) to [-1, 1]
+        igon_dir = 0.0
+        if igon_signal and "score" in igon_signal:
+            igon_dir = (igon_signal["score"] - 50) / 50  # 0-100 -> [-1, 1]
+            # Boost signal if it passes all Igon criteria
+            if igon_signal.get("passes_igon_screen"):
+                igon_dir = max(igon_dir, 0.5)
+
         # Weighted combination
-        combined = (
-            self.weights["dnn"] * dnn_dir +
-            self.weights["rnn"] * rnn_dir +
-            self.weights["dql"] * dql_dir
-        )
+        if igon_signal:
+            combined = (
+                self.weights["dnn"] * dnn_dir +
+                self.weights["rnn"] * rnn_dir +
+                self.weights["dql"] * dql_dir +
+                self.weights["igon"] * igon_dir
+            )
+        else:
+            # Without Igon data, redistribute weight to other models
+            w_sum = self.weights["dnn"] + self.weights["rnn"] + self.weights["dql"]
+            combined = (
+                (self.weights["dnn"] / w_sum) * dnn_dir +
+                (self.weights["rnn"] / w_sum) * rnn_dir +
+                (self.weights["dql"] / w_sum) * dql_dir
+            )
 
         # Determine signal
         if combined > 0.15:
@@ -481,15 +500,19 @@ class EnsemblePredictor:
 
         confidence = min(abs(combined), 1.0)
 
+        components = {
+            "dnn": round(dnn_dir, 4),
+            "rnn": round(rnn_dir, 4),
+            "dql": round(dql_dir, 4),
+        }
+        if igon_signal:
+            components["igon"] = round(igon_dir, 4)
+
         return {
             "signal": signal,
             "confidence": round(confidence, 4),
             "combined_score": round(combined, 4),
-            "components": {
-                "dnn": round(dnn_dir, 4),
-                "rnn": round(rnn_dir, 4),
-                "dql": round(dql_dir, 4),
-            },
+            "components": components,
         }
 
     def update_weights(self, dnn_acc: float, rnn_acc: float, dql_acc: float):

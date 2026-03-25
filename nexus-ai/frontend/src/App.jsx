@@ -6,6 +6,7 @@ import RiskEngine from './components/RiskEngine';
 import TradingBot from './components/TradingBot';
 import Sentiment from './components/Sentiment';
 import Chat from './components/Chat';
+import IgonScreener from './components/IgonScreener';
 import './styles.css';
 
 const TABS = [
@@ -13,6 +14,7 @@ const TABS = [
   { id: 'models', label: 'AI Models' },
   { id: 'risk', label: 'Risk Engine' },
   { id: 'sentiment', label: 'Sentiment' },
+  { id: 'igon', label: 'Igon Screen' },
   { id: 'bot', label: 'Trading Bot' },
   { id: 'chat', label: 'Claude Chat' },
 ];
@@ -185,6 +187,9 @@ export default function App() {
             data={sentimentData}
             onScrape={handleScrapeSentiment}
           />
+        )}
+        {tab === 'igon' && (
+          <IgonScreener symbol={symbol} />
         )}
         {tab === 'bot' && (
           <TradingBot

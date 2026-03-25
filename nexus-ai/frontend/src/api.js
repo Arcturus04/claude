@@ -39,4 +39,11 @@ export const api = {
     take_profit: params.take_profit || 0.0185,
     initial_capital: params.initial_capital || 10000,
   }),
+  // Igon Value Screener
+  igonMethod: () => request('GET', '/igon/method'),
+  igonScreen: (symbol) => request('POST', '/igon/screen', { symbol }),
+  igonScore: (params) => request('POST', '/igon/score', params),
+  igonPositionSize: (params) => request('POST', '/igon/position-size', params),
+  igonExitSchedule: (params) => request('POST', '/igon/exit-schedule', params),
+  igonBatchScreen: (symbols) => request('POST', '/igon/batch-screen', symbols),
 };
