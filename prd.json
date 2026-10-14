@@ -1,0 +1,76 @@
+{
+  "project": "Weekly Content Batch",
+  "description": "Generate a full week of social media content across LinkedIn, X, and Instagram",
+  "user_stories": [
+    {
+      "id": "post-1",
+      "title": "LinkedIn Post - AI Tools Comparison",
+      "description": "Write three LinkedIn post variations comparing AG and Claude Code for business use cases",
+      "acceptance_criteria": [
+        "Three variations saved in /output/drafts/",
+        "Each under 200 words",
+        "No banned words",
+        "Uses AG instead of anti-gravity",
+        "No m-dashes",
+        "Starts with a hook",
+        "Ends with a question or CTA"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "post-2",
+      "title": "X Thread - Claude Code Levels",
+      "description": "Write a 5-tweet thread about the 7 levels of Claude Code mastery",
+      "acceptance_criteria": [
+        "5 tweets, each under 280 characters",
+        "First tweet is a strong hook",
+        "Each tweet is standalone but connected",
+        "No banned words",
+        "Saved in /output/drafts/"
+      ],
+      "status": "done"
+    },
+    {
+      "id": "post-3",
+      "title": "Instagram Carousel - Plan Mode Tips",
+      "description": "Write an Instagram carousel caption and 10-slide outline about using plan mode effectively",
+      "acceptance_criteria": [
+        "Caption is 150-200 words",
+        "10 slide outlines, one idea per slide",
+        "Starts with a pattern interrupt",
+        "Ends with save CTA",
+        "No banned words",
+        "Saved in /output/drafts/"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "post-4",
+      "title": "LinkedIn Post - CLAUDE.md Setup",
+      "description": "Write three LinkedIn post variations about how to set up your CLAUDE.md file properly",
+      "acceptance_criteria": [
+        "Three variations saved in /output/drafts/",
+        "Each under 200 words",
+        "No banned words",
+        "Practical tips with examples",
+        "Starts with a hook",
+        "Ends with a question or CTA"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "post-5",
+      "title": "X Post - Slash Commands",
+      "description": "Write three standalone X posts about slash commands saving time",
+      "acceptance_criteria": [
+        "Three posts, each under 280 characters",
+        "Punchy and specific",
+        "No banned words",
+        "Saved in /output/drafts/"
+      ],
+      "status": "pending"
+    }
+  ],
+  "completion_criteria": "All user stories have status 'done' and all drafts pass the banned words check",
+  "max_iterations": 10
+}

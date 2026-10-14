@@ -1,0 +1,33 @@
+# ─── NEXUS•AI Backend Dependencies ───
+# Core ML
+tensorflow>=2.15.0
+scikit-learn>=1.4.0
+numpy>=1.26.0
+pandas>=2.2.0
+
+# API Server
+fastapi>=0.110.0
+uvicorn>=0.27.0
+python-dotenv>=1.0.0
+
+# Market Data
+yfinance>=0.2.36
+
+# Sentiment Scraping
+praw>=7.7.0          # Reddit API
+tweepy>=4.14.0       # Twitter/X API
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+
+# NLP / Sentiment Analysis
+transformers>=4.38.0
+torch>=2.2.0
+vaderSentiment>=3.3.2
+
+# Claude AI Integration
+anthropic>=0.18.0
+
+# Utilities
+schedule>=1.2.0
+cors>=1.0.1
+aiohttp>=3.9.0

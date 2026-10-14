@@ -1,0 +1,10 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write",
+        "command": "if echo \"$CLAUDE_TOOL_INPUT\" | grep -q '/output/drafts/'; then python3 -c \"import sys; banned=open('docs/banned-words.txt').read().strip().split('\\n'); content=open(sys.argv[1]).read().lower(); found=[w for w in banned if w.strip() in content]; print('BANNED WORDS FOUND: ' + ', '.join(found)) if found else print('No banned words found.')\" \"$(echo \"$CLAUDE_TOOL_INPUT\" | grep -o '/output/drafts/[^\"]*')\" 2>/dev/null || echo 'Banned word check skipped'; fi"
+      }
+    ]
+  }
+}
