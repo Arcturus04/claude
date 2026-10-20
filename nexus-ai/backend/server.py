@@ -52,6 +52,13 @@ state = {
     "sentiment_cache": None,
     "last_sentiment_update": None,
     "trained": False,
+    # Training metadata, so every metric and backtest can say what it was
+    # measured on.
+    "training_status": "idle",      # idle | running | complete | failed
+    "training_error": None,
+    "trained_symbol": None,
+    "train_end_date": None,         # last date in the training split
+    "test_period": None,            # (first, last) date of the held-out split
 }
 
 
@@ -62,11 +69,22 @@ async def lifespan(app: FastAPI):
     logger.info("  NEXUS•AI — Artificial Financial Intelligence Platform")
     logger.info("═" * 60)
 
-    # Initialize components
+    # Fresh models start untrained: reset everything derived from training or
+    # scraping, so a restarted app never reports a previous run's results.
+    state.update({
+        "market_data": None, "features_df": None,
+        "sentiment_cache": None, "last_sentiment_update": None,
+        "trained": False, "training_status": "idle", "training_error": None,
+        "trained_symbol": None, "train_end_date": None, "test_period": None,
+    })
+
+    # Initialize components. Model input sizes come from the feature engine so
+    # the two cannot drift apart.
     state["feature_engine"] = FeatureEngine(lags=5)
-    state["dnn"] = DNNPredictor(input_dim=14)
-    state["rnn"] = RNNPredictor(n_features=14)
-    state["dql"] = DQLAgent(state_dim=14)
+    n_features = len(state["feature_engine"].get_feature_columns())
+    state["dnn"] = DNNPredictor(input_dim=n_features)
+    state["rnn"] = RNNPredictor(n_features=n_features)
+    state["dql"] = DQLAgent(state_dim=n_features)
     state["ensemble"] = EnsemblePredictor()
     state["scraper"] = SentimentScraper()
     state["claude"] = ClaudeAnalyst()
@@ -124,8 +142,19 @@ async def root():
     }
 
 
+def _sentiment_has_posts() -> bool:
+    """True only when the last scrape actually collected posts."""
+    cache = state["sentiment_cache"]
+    return bool(cache) and cache.get("total_posts", 0) > 0
+
+
+def _iso_date(value) -> Optional[str]:
+    return value.strftime("%Y-%m-%d") if value is not None else None
+
+
 @app.get("/api/health")
 async def health():
+    test_period = state["test_period"]
     return {
         "status": "healthy",
         "models": {
@@ -133,7 +162,20 @@ async def health():
             "rnn": state["rnn"].get_status() if state["rnn"] else None,
             "dql": state["dql"].get_status() if state["dql"] else None,
         },
-        "sentiment_available": state["sentiment_cache"] is not None,
+        "ensemble": state["ensemble"].get_status() if state["ensemble"] else None,
+        "training": {
+            "status": state["training_status"],
+            "error": state["training_error"],
+            "symbol": state["trained_symbol"],
+            "train_end_date": _iso_date(state["train_end_date"]),
+            "test_period": (
+                [_iso_date(test_period[0]), _iso_date(test_period[1])] if test_period else None
+            ),
+            "features": (
+                state["feature_engine"].get_feature_columns() if state["feature_engine"] else []
+            ),
+        },
+        "sentiment_available": _sentiment_has_posts(),
         "claude_available": state["claude"].client is not None if state["claude"] else False,
     }
 
@@ -141,7 +183,7 @@ async def health():
 # ─── MARKET DATA ─────────────────────────────────────────────
 
 @app.get("/api/market/{symbol}")
-async def get_market_data(symbol: str = "SPY", period: str = "6mo"):
+def get_market_data(symbol: str = "SPY", period: str = "6mo"):
     """Fetch market data from Yahoo Finance."""
     try:
         ticker = yf.Ticker(symbol)
@@ -168,6 +210,8 @@ async def get_market_data(symbol: str = "SPY", period: str = "6mo"):
             "data": data,
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(500, str(e))
 
@@ -188,8 +232,21 @@ async def train_models(req: TrainRequest, background_tasks: BackgroundTasks):
     }
 
 
-async def _train_models_task(req: TrainRequest):
-    """Background task to train all models."""
+def _train_models_task(req: TrainRequest):
+    """
+    Background task to train all models.
+
+    A plain function, not a coroutine: FastAPI runs synchronous background
+    tasks in a worker thread. As a coroutine, minutes of TensorFlow training
+    ran on the event loop and froze every other request, including the
+    /api/health polls the UI uses to watch training progress.
+
+    Every model trains on the chronological training split only and is scored
+    on the held-out split that follows it.
+    """
+    state["training_status"] = "running"
+    state["training_error"] = None
+    state["trained"] = False
     try:
         logger.info(f"Fetching {req.symbol} data for {req.period}...")
 
@@ -198,79 +255,107 @@ async def _train_models_task(req: TrainRequest):
         df = ticker.history(period=req.period)
 
         if df.empty:
-            logger.error(f"No data for {req.symbol}")
-            return
+            raise ValueError(f"No market data for {req.symbol} over {req.period}")
 
         state["market_data"] = df
 
-        # Get current sentiment for feature injection
-        sentiment_score = 0.0
-        if state["sentiment_cache"]:
-            sentiment_score = state["sentiment_cache"].get("overall_sentiment", 0.0)
-
         # Compute features
         fe = state["feature_engine"]
-        features_df = fe.compute_features(df, sentiment=sentiment_score)
+        features_df = fe.compute_features(df)
         state["features_df"] = features_df
 
         feature_cols = fe.get_feature_columns()
         X_train, X_test, y_train, y_test = fe.prepare_data(features_df)
 
+        labelled = features_df.dropna(subset=["direction"])
+        split = len(X_train)
+        test_dates = labelled.index[split:]
+
         logger.info(f"Features computed: {len(features_df)} samples, {len(feature_cols)} features")
-        logger.info(f"Train/Test split: {len(X_train)}/{len(X_test)}")
-
-        # ─── Train DNN ───
-        dnn_acc = state["dnn"].train(X_train, y_train, X_test, y_test,
-                                      epochs=req.epochs_dnn)
-
-        # ─── Train RNN ───
-        rnn_acc = state["rnn"].train(X_train, y_train, X_test, y_test,
-                                      epochs=req.epochs_rnn)
-
-        # ─── Train DQL ───
-        prices = features_df["Close"].values
-        dql_acc = state["dql"].train_on_data(
-            fe.scaler.transform(features_df[feature_cols].values),
-            prices,
-            episodes=req.episodes_dql,
+        logger.info(
+            f"Train/Test split: {len(X_train)}/{len(X_test)} "
+            f"(training data ends {fe.train_end_date.date()})"
         )
 
-        # ─── Update ensemble weights ───
-        state["ensemble"].update_weights(dnn_acc, rnn_acc, dql_acc)
+        # ─── Train DNN ───
+        dnn = state["dnn"]
+        dnn.train(X_train, y_train, X_test, y_test, epochs=req.epochs_dnn)
+
+        # ─── Train RNN ───
+        rnn = state["rnn"]
+        rnn.train(X_train, y_train, X_test, y_test, epochs=req.epochs_rnn)
+
+        # ─── Train DQL on the training split, score it on the test split ───
+        dql = state["dql"]
+        prices = labelled["Close"].values
+        dql.train_on_data(X_train, prices[:split], episodes=req.episodes_dql)
+        dql_eval = dql.evaluate(X_test, prices[split:])
+        dql.accuracy = dql_eval["hit_rate"]
+        dql.baseline_accuracy = dql_eval["baseline"]
+        dql.coverage = dql_eval["coverage"]
+
+        # ─── Weight the ensemble by out-of-sample skill ───
+        state["ensemble"].update_weights({
+            "dnn": (dnn.accuracy, dnn.baseline_accuracy),
+            "rnn": (rnn.accuracy, rnn.baseline_accuracy),
+            "dql": (dql.accuracy, dql.baseline_accuracy),
+        })
+
+        state["trained_symbol"] = req.symbol
+        state["train_end_date"] = fe.train_end_date
+        state["test_period"] = (test_dates[0], test_dates[-1]) if len(test_dates) else None
         state["trained"] = True
+        state["training_status"] = "complete"
+
+        def pct(value):
+            return f"{value:.2f}%" if value is not None else "n/a"
 
         logger.info("═" * 60)
-        logger.info(f"  Training Complete!")
-        logger.info(f"  DNN Accuracy:  {dnn_acc:.2f}%")
-        logger.info(f"  RNN Accuracy:  {rnn_acc:.2f}%")
-        logger.info(f"  DQL Win Rate:  {dql_acc:.2f}%")
-        logger.info(f"  Ensemble Weights: {state['ensemble'].weights}")
+        logger.info("  Training complete - out-of-sample results")
+        logger.info(f"  DNN accuracy:     {pct(dnn.accuracy)} (baseline {pct(dnn.baseline_accuracy)})")
+        logger.info(f"  RNN accuracy:     {pct(rnn.accuracy)} (baseline {pct(rnn.baseline_accuracy)})")
+        logger.info(
+            f"  DQL hit rate:     {pct(dql.accuracy)} (baseline {pct(dql.baseline_accuracy)}, "
+            f"calls on {pct(dql.coverage)} of sessions)"
+        )
+        logger.info(f"  Ensemble weights: {state['ensemble'].weights}")
+        if state["ensemble"].no_skill:
+            logger.info("  No model beat its baseline; ensemble signals carry a warning.")
         logger.info("═" * 60)
 
     except Exception as e:
+        state["training_status"] = "failed"
+        state["training_error"] = str(e)
         logger.error(f"Training failed: {e}", exc_info=True)
 
 
 # ─── PREDICTIONS ──────────────────────────────────────────────
 
 @app.post("/api/predict")
-async def predict(req: PredictRequest):
-    """Get predictions from all trained models."""
+def predict(req: PredictRequest):
+    """Get next-session predictions from all trained models."""
     if not state["trained"]:
         raise HTTPException(400, "Models not trained yet. Call POST /api/train first.")
 
     try:
         fe = state["feature_engine"]
 
-        # Get latest data
+        # One year of history: the 50-day average consumes the first 49 rows
+        # and the LSTM needs a 20-row window after that. Three months left
+        # about 14 rows, so the LSTM never had a full window.
         ticker = yf.Ticker(req.symbol)
-        df = ticker.history(period="3mo")
+        df = ticker.history(period="1y")
+        if df.empty:
+            raise HTTPException(404, f"No data for {req.symbol}")
 
-        sentiment_score = 0.0
-        if state["sentiment_cache"]:
-            sentiment_score = state["sentiment_cache"].get("overall_sentiment", 0.0)
-
-        features_df = fe.compute_features(df, sentiment=sentiment_score)
+        features_df = fe.compute_features(df)
+        needed = state["rnn"].sequence_length
+        if len(features_df) < needed:
+            raise HTTPException(
+                400,
+                f"Only {len(features_df)} sessions of usable history for {req.symbol}; "
+                f"the LSTM needs {needed} after indicator warm-up.",
+            )
         feature_cols = fe.get_feature_columns()
         X = fe.scaler.transform(features_df[feature_cols].values)
 
@@ -308,9 +393,14 @@ async def predict(req: PredictRequest):
                 },
             },
             "ensemble": ensemble_result,
-            "sentiment_injected": sentiment_score,
+            "as_of": features_df.index[-1].strftime("%Y-%m-%d"),
+            "predicts": "direction of the next session after as_of",
+            "trained_symbol": state["trained_symbol"],
+            "symbol_matches_training": req.symbol.upper() == (state["trained_symbol"] or "").upper(),
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(500, str(e))
 
@@ -463,14 +553,26 @@ class BacktestRequest(BaseModel):
     mode: str = "vectorized"    # vectorized or event
 
 
+MIN_BACKTEST_BARS = 20
+
+
 @app.post("/api/backtest")
-async def run_backtest(req: BacktestRequest):
+def run_backtest(req: BacktestRequest):
     """
-    Run backtesting on trained model signals.
+    Backtest a trained model's signals on data it was not trained on.
+
+    Signals are generated for the whole fetched period (the LSTM needs earlier
+    rows as context), but only sessions after the training cutoff are traded.
+    Backtesting the training period instead would report the model's fit to
+    data it has already seen, which says nothing about how it would trade.
     Supports vectorized (fast) and event-based (with risk management) modes.
     """
     if not state["trained"]:
         raise HTTPException(400, "Models not trained. Call POST /api/train first.")
+    if req.model not in ("dnn", "rnn", "ensemble"):
+        raise HTTPException(400, "model must be one of: dnn, rnn, ensemble")
+    if req.mode not in ("vectorized", "event"):
+        raise HTTPException(400, "mode must be one of: vectorized, event")
 
     try:
         fe = state["feature_engine"]
@@ -481,36 +583,43 @@ async def run_backtest(req: BacktestRequest):
         if df.empty:
             raise HTTPException(404, f"No data for {req.symbol}")
 
-        sentiment_score = 0.0
-        if state["sentiment_cache"]:
-            sentiment_score = state["sentiment_cache"].get("overall_sentiment", 0.0)
-
-        features_df = fe.compute_features(df, sentiment=sentiment_score)
+        features_df = fe.compute_features(df)
+        if features_df.empty:
+            raise HTTPException(
+                400,
+                f"Period {req.period} is too short to compute the indicators "
+                f"(the 50-day average alone needs 50 sessions).",
+            )
         feature_cols = fe.get_feature_columns()
         X = fe.scaler.transform(features_df[feature_cols].values)
-        prices = features_df["Close"].values
-        dates = [d.strftime("%Y-%m-%d") for d in features_df.index]
 
-        # Generate signals from selected model
+        # Signal on row r is a forecast for the session after r; the
+        # backtester shifts it forward one bar before applying it.
         if req.model == "dnn":
             signals = generate_model_signals(state["dnn"].model, X)
         elif req.model == "rnn":
-            # RNN needs sequences - generate per-step predictions
-            signals = np.zeros(len(X))
-            seq_len = state["rnn"].sequence_length
-            for i in range(seq_len, len(X)):
-                seq = X[i - seq_len:i].reshape(1, seq_len, -1)
-                prob = state["rnn"].model.predict(seq, verbose=0)[0][0]
-                signals[i] = 1 if prob > 0.55 else (-1 if prob < 0.45 else 0)
+            probs = state["rnn"].predict_proba_series(X)
+            signals = np.where(probs > 0.55, 1, np.where(probs < 0.45, -1, 0))
         else:
-            # Ensemble - combine DNN + DQL signals
+            # Ensemble - combine DNN + DQL signals, one greedy action per row
             dnn_signals = generate_model_signals(state["dnn"].model, X)
-            dql_signals = np.array([
-                1 if state["dql"].act(x) == 1 else
-                (-1 if state["dql"].act(x) == 2 else 0)
-                for x in X
-            ])
+            actions = state["dql"].greedy_actions(X)
+            dql_signals = np.where(actions == 1, 1, np.where(actions == 2, -1, 0))
             signals = np.sign(dnn_signals * 0.6 + dql_signals * 0.4)
+
+        # Keep only sessions after the training cutoff.
+        oos = features_df.index > state["train_end_date"]
+        n_oos = int(oos.sum())
+        if n_oos < MIN_BACKTEST_BARS:
+            raise HTTPException(
+                400,
+                f"Only {n_oos} sessions after the training cutoff "
+                f"({_iso_date(state['train_end_date'])}) in this period; need at least "
+                f"{MIN_BACKTEST_BARS}. Use a longer period, or retrain on an earlier one.",
+            )
+        prices = features_df["Close"].values[oos]
+        dates = [d.strftime("%Y-%m-%d") for d in features_df.index[oos]]
+        signals = np.asarray(signals)[oos]
 
         # Run backtest
         if req.mode == "event":
@@ -526,9 +635,22 @@ async def run_backtest(req: BacktestRequest):
         result["model"] = req.model
         result["symbol"] = req.symbol
         result["mode"] = req.mode
+        result["out_of_sample"] = {
+            "trained_symbol": state["trained_symbol"],
+            "train_end_date": _iso_date(state["train_end_date"]),
+            "start": dates[0],
+            "end": dates[-1],
+            "sessions": n_oos,
+            "note": (
+                "Only sessions after the training cutoff are traded. "
+                "Past performance does not predict future results."
+            ),
+        }
 
         return result
 
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(500, str(e))
 

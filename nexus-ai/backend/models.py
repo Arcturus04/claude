@@ -30,32 +30,49 @@ logger = logging.getLogger(__name__)
 
 class FeatureEngine:
     """
-    Transforms raw price data + sentiment into ML-ready features.
-    Computes technical indicators and merges social sentiment scores.
+    Transforms raw OHLCV price data into ML-ready features.
+
+    Every feature on row t is computed from data up to and including the close
+    of day t, and the label on row t is the direction of the *next* day's
+    return. The models therefore learn to predict t -> t+1 from what was
+    knowable at the close of t.
+
+    Social sentiment is deliberately not a model input. The scraper produces a
+    single current reading, not a history aligned with the price series, so as
+    a feature it was one constant copied onto every row: the models could learn
+    nothing from it during training, and any different value at prediction time
+    only perturbed the output through an untrained weight. Sentiment is used by
+    the Claude analysis layer instead.
     """
 
     def __init__(self, lags: int = 5):
         self.lags = lags
         self.scaler = StandardScaler()
         self.fitted = False
+        self.train_end_date = None
 
-    def compute_features(self, df: pd.DataFrame, sentiment: float = 0.0) -> pd.DataFrame:
+    def compute_features(self, df: pd.DataFrame) -> pd.DataFrame:
         """
         Generate features from OHLCV data:
-        - Log returns (multiple lags)
-        - Moving averages (SMA, EMA)
+        - Log returns (today's and the previous lags - 1 days)
+        - Moving averages (SMA, EMA) relative to the close
         - Volatility (rolling std)
         - RSI, MACD signals
         - Volume momentum
-        - Social sentiment score
+        - ATR
+
+        Rows lost to indicator warm-up are dropped. The final row is kept with
+        an empty label: its features are the input for a live prediction of the
+        next session, whose outcome is not yet known.
         """
         data = df.copy()
 
         # Log returns
         data["log_return"] = np.log(data["Close"] / data["Close"].shift(1))
 
-        # Lagged returns as features
-        for lag in range(1, self.lags + 1):
+        # Recent returns as features. return_lag_0 is today's return, which is
+        # known at today's close; return_lag_k is the return k days earlier.
+        for lag in range(self.lags):
             data[f"return_lag_{lag}"] = data["log_return"].shift(lag)
 
         # Moving averages
@@ -96,36 +113,51 @@ class FeatureEngine:
         else:
             data["atr"] = data["volatility_20"]
 
-        # Social sentiment feature
-        data["sentiment"] = sentiment
+        # Label: did the NEXT session close higher? Labelling a row with its own
+        # return leaked the answer, because the moving averages, RSI, MACD,
+        # volatility and ATR on that row are all computed from the same close
+        # that defines it. A linear model scored ~93% out of sample on pure
+        # random-walk prices with that label; with this one it scores ~50%.
+        data["next_log_return"] = data["log_return"].shift(-1)
+        data["direction"] = np.where(data["next_log_return"] > 0, 1.0, 0.0)
+        data.loc[data["next_log_return"].isna(), "direction"] = np.nan
 
-        # Direction label (what we're predicting)
-        data["direction"] = np.where(data["log_return"] > 0, 1, 0)
-
-        # Drop NaN rows
-        data.dropna(inplace=True)
+        # Drop indicator warm-up rows only; the last row keeps its NaN label.
+        data = data.dropna(subset=self.get_feature_columns() + ["log_return"])
 
         return data
 
     def get_feature_columns(self) -> List[str]:
         """Return the feature column names used for training."""
-        cols = [f"return_lag_{i}" for i in range(1, self.lags + 1)]
+        cols = [f"return_lag_{i}" for i in range(self.lags)]
         cols += [
             "sma_20", "sma_50", "ema_12",
             "volatility_20", "rsi_normalized", "macd",
-            "volume_ratio", "atr", "sentiment",
+            "volume_ratio", "atr",
         ]
         return cols
 
     def prepare_data(self, df: pd.DataFrame, train_ratio: float = 0.8):
-        """Split and scale data for training."""
+        """
+        Chronological train/test split and scaling.
+
+        Only rows with a known label are used. The scaler is fit on the
+        training rows only, and the date of the last training row is recorded
+        so that backtests can be restricted to dates the models never saw.
+        """
+        labelled = df.dropna(subset=["direction"])
         feature_cols = self.get_feature_columns()
-        X = df[feature_cols].values
-        y = df["direction"].values
+        X = labelled[feature_cols].values
+        y = labelled["direction"].values.astype(int)
 
         split = int(len(X) * train_ratio)
+        if split < 1 or split >= len(X):
+            raise ValueError(
+                f"Not enough data to split: {len(X)} labelled rows after indicator warm-up"
+            )
         X_train, X_test = X[:split], X[split:]
         y_train, y_test = y[:split], y[split:]
+        self.train_end_date = labelled.index[split - 1]
 
         # Fit scaler on training data only
         self.scaler.fit(X_train)
@@ -136,6 +168,21 @@ class FeatureEngine:
 
         return X_train, X_test, y_train, y_test
 
+    @staticmethod
+    def majority_baseline(y_test) -> float:
+        """
+        Accuracy of always predicting the test set's most common direction.
+
+        A directional model is only skilful if it beats this. In a rising
+        market "always up" can score well above 50%, so a raw accuracy figure
+        quoted without its baseline says little.
+        """
+        y_test = np.asarray(y_test)
+        if len(y_test) == 0:
+            return 0.0
+        up_share = float(np.mean(y_test))
+        return max(up_share, 1.0 - up_share) * 100
+
 
 class DNNPredictor:
     """
@@ -143,11 +190,14 @@ class DNNPredictor:
     Architecture from Hilpisch Chapter 7.
     """
 
-    def __init__(self, input_dim: int = 14, hidden_units: int = 64,
+    def __init__(self, input_dim: int = 13, hidden_units: int = 64,
                  dropout_rate: float = 0.3, learning_rate: float = 0.001):
+        self.input_dim = input_dim
         self.model = self._build_model(input_dim, hidden_units, dropout_rate, learning_rate)
         self.history = None
         self.accuracy = 0.0
+        self.baseline_accuracy = None
+        self.trained = False
         self.name = "DNN Predictor"
 
     def _build_model(self, input_dim, hu, dropout, lr):
@@ -180,11 +230,16 @@ class DNNPredictor:
         )
         y_pred = (self.model.predict(X_test, verbose=0) > 0.5).astype(int).flatten()
         self.accuracy = accuracy_score(y_test, y_pred) * 100
-        logger.info(f"DNN accuracy: {self.accuracy:.2f}%")
+        self.baseline_accuracy = FeatureEngine.majority_baseline(y_test)
+        self.trained = True
+        logger.info(
+            f"DNN out-of-sample accuracy: {self.accuracy:.2f}% "
+            f"(majority-class baseline {self.baseline_accuracy:.2f}%)"
+        )
         return self.accuracy
 
     def predict(self, X) -> Tuple[int, float]:
-        """Predict direction and confidence."""
+        """Predict next-session direction and confidence."""
         prob = self.model.predict(X.reshape(1, -1), verbose=0)[0][0]
         direction = 1 if prob > 0.5 else 0
         confidence = prob if direction == 1 else 1 - prob
@@ -194,8 +249,12 @@ class DNNPredictor:
         return {
             "name": self.name,
             "type": "Dense Neural Network",
-            "accuracy": round(self.accuracy, 2),
-            "status": "active" if self.accuracy > 0 else "untrained",
+            "accuracy": round(self.accuracy, 2) if self.trained else None,
+            "baseline_accuracy": (
+                round(self.baseline_accuracy, 2) if self.baseline_accuracy is not None else None
+            ),
+            "status": "active" if self.trained else "untrained",
+            "input_features": self.input_dim,
             "architecture": "Dense(64) → Dense(64) → Dense(32) → Dense(1)",
         }
 
@@ -206,12 +265,14 @@ class RNNPredictor:
     Architecture from Hilpisch Chapter 8.
     """
 
-    def __init__(self, sequence_length: int = 20, n_features: int = 14,
+    def __init__(self, sequence_length: int = 20, n_features: int = 13,
                  hidden_units: int = 64, learning_rate: float = 0.001):
         self.sequence_length = sequence_length
         self.n_features = n_features
         self.model = self._build_model(n_features, hidden_units, learning_rate)
         self.accuracy = 0.0
+        self.baseline_accuracy = None
+        self.trained = False
         self.name = "RNN Sequencer"
 
     def _build_model(self, n_features, hu, lr):
@@ -231,11 +292,18 @@ class RNNPredictor:
         return model
 
     def _create_sequences(self, X, y):
-        """Create sliding window sequences for LSTM input."""
+        """
+        Create sliding-window sequences for LSTM input.
+
+        Each window ends on row i + L - 1 and takes that row's label, which is
+        the direction of the session after the window: the same next-session
+        target the DNN predicts from a single row.
+        """
+        L = self.sequence_length
         Xs, ys = [], []
-        for i in range(len(X) - self.sequence_length):
-            Xs.append(X[i:i + self.sequence_length])
-            ys.append(y[i + self.sequence_length])
+        for i in range(len(X) - L + 1):
+            Xs.append(X[i:i + L])
+            ys.append(y[i + L - 1])
         return np.array(Xs), np.array(ys)
 
     def train(self, X_train, y_train, X_test, y_test,
@@ -244,7 +312,15 @@ class RNNPredictor:
         logger.info(f"Training RNN/LSTM: {epochs} epochs")
 
         X_train_seq, y_train_seq = self._create_sequences(X_train, y_train)
-        X_test_seq, y_test_seq = self._create_sequences(X_test, y_test)
+
+        # Give each test window the preceding training rows as context so that
+        # windows end on every test row, and the LSTM is scored on exactly the
+        # same sessions as the DNN. Context rows contribute features only (past
+        # data, known at prediction time); every label scored is a test label.
+        ctx = self.sequence_length - 1
+        X_test_ctx = np.vstack([X_train[-ctx:], X_test]) if ctx else X_test
+        y_test_ctx = np.concatenate([y_train[-ctx:], y_test]) if ctx else y_test
+        X_test_seq, y_test_seq = self._create_sequences(X_test_ctx, y_test_ctx)
 
         if len(X_train_seq) == 0 or len(X_test_seq) == 0:
             logger.warning("Not enough data for RNN sequences")
@@ -259,25 +335,51 @@ class RNNPredictor:
         )
         y_pred = (self.model.predict(X_test_seq, verbose=0) > 0.5).astype(int).flatten()
         self.accuracy = accuracy_score(y_test_seq, y_pred) * 100
-        logger.info(f"RNN accuracy: {self.accuracy:.2f}%")
+        self.baseline_accuracy = FeatureEngine.majority_baseline(y_test_seq)
+        self.trained = True
+        logger.info(
+            f"RNN out-of-sample accuracy: {self.accuracy:.2f}% "
+            f"(majority-class baseline {self.baseline_accuracy:.2f}%)"
+        )
         return self.accuracy
 
     def predict(self, X_sequence) -> Tuple[int, float]:
-        """Predict from a sequence of features."""
+        """Predict next-session direction from the most recent window."""
         if len(X_sequence) < self.sequence_length:
-            return 0, 0.5
+            raise ValueError(
+                f"LSTM needs {self.sequence_length} rows of features, got {len(X_sequence)}"
+            )
         seq = X_sequence[-self.sequence_length:].reshape(1, self.sequence_length, -1)
         prob = self.model.predict(seq, verbose=0)[0][0]
         direction = 1 if prob > 0.5 else 0
         confidence = prob if direction == 1 else 1 - prob
         return direction, float(confidence)
 
+    def predict_proba_series(self, X) -> np.ndarray:
+        """
+        Up-probability for every row that ends a full window, NaN otherwise.
+
+        Row r's value comes from the window ending on row r, so it is a
+        forecast for the session after r: the alignment backtests expect.
+        """
+        L = self.sequence_length
+        out = np.full(len(X), np.nan)
+        if len(X) < L:
+            return out
+        windows = np.stack([X[i - L + 1:i + 1] for i in range(L - 1, len(X))])
+        out[L - 1:] = self.model.predict(windows, verbose=0).flatten()
+        return out
+
     def get_status(self) -> Dict:
         return {
             "name": self.name,
             "type": "LSTM Recurrent Neural Net",
-            "accuracy": round(self.accuracy, 2),
-            "status": "active" if self.accuracy > 0 else "untrained",
+            "accuracy": round(self.accuracy, 2) if self.trained else None,
+            "baseline_accuracy": (
+                round(self.baseline_accuracy, 2) if self.baseline_accuracy is not None else None
+            ),
+            "status": "active" if self.trained else "untrained",
+            "input_features": self.n_features,
             "architecture": f"LSTM(64, seq={self.sequence_length}) → LSTM(32) → Dense(1)",
         }
 
@@ -292,18 +394,21 @@ class DQLAgent:
     Uses experience replay and epsilon-greedy exploration.
     """
 
-    def __init__(self, state_dim: int = 14, gamma: float = 0.95,
+    def __init__(self, state_dim: int = 13, gamma: float = 0.95,
                  hidden_units: int = 64, learning_rate: float = 0.001):
         self.state_dim = state_dim
         self.gamma = gamma          # Discount factor for delayed rewards
         self.epsilon = 1.0          # Exploration rate
         self.epsilon_min = 0.01     # Minimum exploration
-        self.epsilon_decay = 0.995  # Decay per episode
+        self.epsilon_decay = 0.995  # Decay per replay step
         self.batch_size = 32
         self.memory = deque(maxlen=2000)  # Experience replay buffer
         self.model = self._build_model(state_dim, hidden_units, learning_rate)
-        self.accuracy = 0.0
-        self.total_reward = 0.0
+        self.accuracy = None        # Out-of-sample directional hit rate
+        self.baseline_accuracy = None
+        self.coverage = None        # Share of test sessions with a BUY/SELL call
+        self.total_reward = 0.0     # Best training-episode reward (in-sample)
+        self.trained = False
         self.name = "DQL Agent"
 
     def _build_model(self, state_dim, hu, lr):
@@ -316,46 +421,102 @@ class DQLAgent:
         model.compile(loss="mse", optimizer=Adam(learning_rate=lr))
         return model
 
-    def act(self, state) -> int:
-        """Choose action using epsilon-greedy policy."""
-        if random.random() <= self.epsilon:
+    def q_values(self, states: np.ndarray) -> np.ndarray:
+        """Q-values for a batch of states, shape (n, 3).
+
+        Calls the network directly: Keras' predict() carries tens of
+        milliseconds of fixed overhead per call, which dominated training time
+        when it was invoked per sample.
+        """
+        states = np.asarray(states, dtype=np.float32).reshape(-1, self.state_dim)
+        return self.model(states, training=False).numpy()
+
+    def act(self, state, explore: bool = True) -> int:
+        """Choose an action: epsilon-greedy while training, greedy otherwise.
+
+        Prediction and backtesting must pass explore=False. With exploration on,
+        a trained agent still picks a random action with probability epsilon,
+        so the same state could yield different signals on different calls.
+        """
+        if explore and random.random() <= self.epsilon:
             return random.randint(0, 2)  # Explore
-        q_values = self.model.predict(state.reshape(1, -1), verbose=0)[0]
-        return int(np.argmax(q_values))  # Exploit
+        return int(np.argmax(self.q_values(state)[0]))  # Exploit
+
+    def greedy_actions(self, states: np.ndarray) -> np.ndarray:
+        """Greedy action for every state in a batch (0=HOLD, 1=BUY, 2=SELL)."""
+        if len(states) == 0:
+            return np.zeros(0, dtype=int)
+        return np.argmax(self.q_values(states), axis=1)
 
     def remember(self, state, action, reward, next_state, done):
         """Store experience in replay buffer."""
         self.memory.append((state, action, reward, next_state, done))
 
     def replay(self):
-        """Train on a batch of experiences from replay buffer."""
+        """Train on a batch of experiences from the replay buffer.
+
+        One batched forward pass for the current and next states and one
+        gradient step for the whole batch, instead of two predict() calls and
+        a fit() per sample. Same Q-learning update:
+            Q(s, a) <- r + gamma * max_a' Q(s', a')
+        """
         if len(self.memory) < self.batch_size:
             return
 
         batch = random.sample(self.memory, self.batch_size)
+        states = np.array([b[0] for b in batch], dtype=np.float32)
+        actions = np.array([b[1] for b in batch])
+        rewards = np.array([b[2] for b in batch], dtype=np.float32)
+        next_states = np.array([b[3] for b in batch], dtype=np.float32)
+        dones = np.array([b[4] for b in batch], dtype=bool)
 
-        for state, action, reward, next_state, done in batch:
-            target = reward
-            if not done:
-                # Q-learning update: Q(s,a) = r + γ * max Q(s', a')
-                target = reward + self.gamma * np.max(
-                    self.model.predict(next_state.reshape(1, -1), verbose=0)[0]
-                )
-
-            target_vec = self.model.predict(state.reshape(1, -1), verbose=0)[0]
-            target_vec[action] = target
-            self.model.fit(state.reshape(1, -1), target_vec.reshape(1, -1),
-                           epochs=1, verbose=0)
+        targets = self.q_values(states)
+        next_max = self.q_values(next_states).max(axis=1)
+        updated = rewards + np.where(dones, 0.0, self.gamma * next_max)
+        targets[np.arange(self.batch_size), actions] = updated
+        self.model.train_on_batch(states, targets)
 
         # Decay exploration rate
         if self.epsilon > self.epsilon_min:
             self.epsilon *= self.epsilon_decay
+
+    def evaluate(self, features: np.ndarray, prices: np.ndarray) -> Dict:
+        """
+        Out-of-sample score on data the agent did not train on.
+
+        The agent acts greedily on every session but the last. A BUY is a hit
+        if the next close is higher, a SELL if it is lower; HOLDs make no
+        directional claim and are excluded, which is why coverage is reported
+        alongside the hit rate.
+        """
+        empty = {"hit_rate": None, "baseline": None, "coverage": 0.0, "calls": 0}
+        if len(features) < 2:
+            return empty
+        actions = self.greedy_actions(features[:-1])
+        next_move = np.sign(np.diff(prices))
+        called = actions != 0
+        if not called.any():
+            return empty
+        predicted = np.where(actions == 1, 1.0, -1.0)
+        hits = (predicted == next_move) & called
+        # Baseline: always calling the majority direction on the same sessions.
+        up_share = float(np.mean(next_move[called] > 0))
+        return {
+            "hit_rate": float(hits.sum() / called.sum() * 100),
+            "baseline": max(up_share, 1.0 - up_share) * 100,
+            "coverage": float(called.mean() * 100),
+            "calls": int(called.sum()),
+        }
 
     def train_on_data(self, features: np.ndarray, prices: np.ndarray,
                       episodes: int = 50):
         """
         Train the DQL agent on historical data.
         Simulates trading and learns from rewards.
+
+        Pass training rows only. Scoring is done separately by evaluate() on
+        held-out rows; the share of profitable training episodes this method
+        used to report was an in-sample number, not an accuracy.
         """
         logger.info(f"Training DQL Agent: {episodes} episodes")
 
@@ -407,24 +568,22 @@ class DQLAgent:
                     f"ε: {self.epsilon:.4f}"
                 )
 
-        self.total_reward = best_reward
-        # Approximate accuracy from reward sign
-        positive = len([r for r in rewards_history if r > 0])
-        self.accuracy = (positive / len(rewards_history)) * 100 if rewards_history else 0
+        self.total_reward = best_reward if rewards_history else 0.0
+        self.trained = True
 
-        logger.info(f"DQL training complete. Best reward: {best_reward:.2f}")
-        return self.accuracy
+        logger.info(f"DQL training complete. Best training reward: {self.total_reward:.2f}")
+        return self.total_reward
 
     def get_signal(self, state) -> Dict:
-        """Get trading signal from trained agent."""
-        action = self.act(state)
-        q_values = self.model.predict(state.reshape(1, -1), verbose=0)[0]
+        """Get the greedy trading signal for one state."""
+        q_values = self.q_values(state)[0]
+        action = int(np.argmax(q_values))
         confidence = float(np.max(q_values) / (np.sum(np.abs(q_values)) + 1e-8))
 
         signals = {0: "HOLD", 1: "BUY", 2: "SELL"}
         return {
             "action": signals[action],
-            "confidence": round(min(confidence, 1.0), 4),
+            "confidence": round(min(max(confidence, 0.0), 1.0), 4),
             "q_values": {signals[i]: round(float(q_values[i]), 4) for i in range(3)},
         }
 
@@ -432,9 +591,18 @@ class DQLAgent:
         return {
             "name": self.name,
             "type": "Deep Q-Learning",
-            "accuracy": round(self.accuracy, 2),
-            "status": "active" if self.accuracy > 0 else "training",
+            "accuracy": round(self.accuracy, 2) if self.accuracy is not None else None,
+            "accuracy_definition": "out-of-sample hit rate on BUY/SELL calls",
+            "baseline_accuracy": (
+                round(self.baseline_accuracy, 2) if self.baseline_accuracy is not None else None
+            ),
+            "coverage": round(self.coverage, 2) if self.coverage is not None else None,
+            "status": "active" if self.trained else "untrained",
+            "input_features": self.state_dim,
             "epsilon": round(self.epsilon, 4),
+            "gamma": self.gamma,
+            "epsilon_decay": self.epsilon_decay,
+            "batch_size": self.batch_size,
             "memory_size": len(self.memory),
             "total_reward": round(self.total_reward, 2),
             "architecture": "Dense(64) → Dense(64) → Dense(3) [Q-values]",
@@ -443,13 +611,22 @@ class DQLAgent:
 
 class EnsemblePredictor:
     """
-    Meta-learner that combines signals from DNN, RNN, and DQL.
-    Weighted by individual model accuracy.
+    Weighted average of the DNN, RNN and DQL signals.
+
+    This is a fixed weighting rule, not a learned stacking model. Each model's
+    weight is its out-of-sample accuracy in excess of the majority-class
+    baseline, so a model with no demonstrated skill gets no say. If no model
+    beats the baseline, the weights fall back to equal and every prediction
+    carries a warning saying so.
     """
+
+    IGON_WEIGHT = 0.15
 
     def __init__(self):
         self.name = "Ensemble α"
-        self.weights = {"dnn": 0.30, "rnn": 0.30, "dql": 0.25, "igon": 0.15}
+        self.weights = {"dnn": 1 / 3, "rnn": 1 / 3, "dql": 1 / 3, "igon": self.IGON_WEIGHT}
+        self.skill = {}
+        self.no_skill = True
 
     def predict(self, dnn_signal: Tuple, rnn_signal: Tuple,
                 dql_signal: Dict, igon_signal: Optional[Dict] = None) -> Dict:
@@ -473,22 +650,18 @@ class EnsemblePredictor:
             if igon_signal.get("passes_igon_screen"):
                 igon_dir = max(igon_dir, 0.5)
 
-        # Weighted combination
+        # Weighted combination. Model weights sum to 1; with an Igon signal
+        # they are scaled down so the Igon share keeps the total at 1.
+        models_combined = (
+            self.weights["dnn"] * dnn_dir +
+            self.weights["rnn"] * rnn_dir +
+            self.weights["dql"] * dql_dir
+        )
         if igon_signal:
-            combined = (
-                self.weights["dnn"] * dnn_dir +
-                self.weights["rnn"] * rnn_dir +
-                self.weights["dql"] * dql_dir +
-                self.weights["igon"] * igon_dir
-            )
+            w_igon = self.weights["igon"]
+            combined = (1 - w_igon) * models_combined + w_igon * igon_dir
         else:
-            # Without Igon data, redistribute weight to other models
-            w_sum = self.weights["dnn"] + self.weights["rnn"] + self.weights["dql"]
-            combined = (
-                (self.weights["dnn"] / w_sum) * dnn_dir +
-                (self.weights["rnn"] / w_sum) * rnn_dir +
-                (self.weights["dql"] / w_sum) * dql_dir
-            )
+            combined = models_combined
 
         # Determine signal
         if combined > 0.15:
@@ -508,25 +681,44 @@ class EnsemblePredictor:
         if igon_signal:
             components["igon"] = round(igon_dir, 4)
 
-        return {
+        result = {
             "signal": signal,
             "confidence": round(confidence, 4),
             "combined_score": round(combined, 4),
             "components": components,
+            "no_skill_warning": self.no_skill,
         }
+        if self.no_skill:
+            result["warning"] = (
+                "No model beat the majority-class baseline out of sample, so this "
+                "signal is not evidence of predictive skill."
+            )
+        return result
 
-    def update_weights(self, dnn_acc: float, rnn_acc: float, dql_acc: float):
-        """Adjust weights based on model performance."""
-        total = dnn_acc + rnn_acc + dql_acc
-        if total > 0:
-            self.weights["dnn"] = dnn_acc / total
-            self.weights["rnn"] = rnn_acc / total
-            self.weights["dql"] = dql_acc / total
+    def update_weights(self, scores: Dict[str, Tuple[Optional[float], Optional[float]]]):
+        """
+        Weight each model by its out-of-sample accuracy above its own baseline.
+
+        scores maps "dnn" / "rnn" / "dql" to (accuracy, baseline) in percent.
+        Each baseline is the majority-class rate on the sessions that model was
+        scored on. None means the model made no scoreable calls. Models at or
+        below their baseline get zero weight.
+        """
+        self.skill = {}
+        for k in ("dnn", "rnn", "dql"):
+            acc, base = scores.get(k, (None, None))
+            self.skill[k] = max(acc - base, 0.0) if acc is not None and base is not None else 0.0
+        total = sum(self.skill.values())
+        self.no_skill = total <= 0
+        for k in self.skill:
+            self.weights[k] = (self.skill[k] / total) if total > 0 else 1 / 3
 
     def get_status(self) -> Dict:
         return {
             "name": self.name,
-            "type": "Meta-Learner Ensemble",
-            "weights": self.weights,
+            "type": "Skill-weighted average (not a learned meta-model)",
+            "weights": {k: round(v, 4) for k, v in self.weights.items()},
+            "skill_over_baseline": {k: round(v, 2) for k, v in self.skill.items()},
+            "no_skill_warning": self.no_skill,
             "status": "active",
         }
