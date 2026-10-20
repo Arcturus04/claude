@@ -1,221 +1,214 @@
-# ╔══════════════════════════════════════════════════════════════╗
-# ║  NEXUS•AI — Artificial Financial Intelligence Platform     ║
-# ║  ML Trading Models + Social Sentiment + Claude Analysis    ║
-# ╚══════════════════════════════════════════════════════════════╝
+# NEXUS•AI - Financial Intelligence Platform
+
+ML trading models, social sentiment and Claude analysis, built on the methods in
+*Artificial Intelligence in Finance* by Yves Hilpisch (O'Reilly, 2021).
+
+**Educational project. Not financial advice.**
 
 ## Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                    REACT FRONTEND (:3000)                    │
-│  Dashboard │ AI Models │ Risk Engine │ Trading Bot │ Chat   │
+│                REACT + VITE FRONTEND (:3000)                 │
+│  Dashboard │ AI Models │ Risk │ Sentiment │ Trading Bot │ Chat│
 └──────────────────────────┬──────────────────────────────────┘
-                           │ REST API
+                           │ REST API (proxied by Vite)
 ┌──────────────────────────▼──────────────────────────────────┐
 │                 FASTAPI BACKEND (:8000)                      │
 │                                                              │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌────────────┐  │
-│  │   DNN    │  │   RNN    │  │   DQL    │  │  Ensemble  │  │
-│  │ Predictor│  │ Sequencer│  │  Agent   │  │  Meta-Learn│  │
-│  └────┬─────┘  └────┬─────┘  └────┬─────┘  └─────┬──────┘  │
-│       └──────────────┴─────────────┴──────────────┘          │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌────────────┐   │
+│  │   DNN    │  │   LSTM   │  │   DQL    │  │  Ensemble  │   │
+│  │ Predictor│  │ Sequencer│  │  Agent   │  │ (weighted) │   │
+│  └────┬─────┘  └────┬─────┘  └────┬─────┘  └─────┬──────┘   │
+│       └─────────────┴─────────────┴──────────────┘          │
 │                          │                                   │
-│  ┌───────────────────────▼───────────────────────────────┐  │
-│  │              FEATURE ENGINE                            │  │
-│  │  Technical Indicators + Sentiment Score → ML Features  │  │
-│  └───────────┬────────────────────────────┬──────────────┘  │
-│              │                            │                  │
-│  ┌───────────▼──────────┐  ┌─────────────▼──────────────┐  │
-│  │   MARKET DATA        │  │   SENTIMENT SCRAPER        │  │
-│  │   Yahoo Finance API  │  │   Reddit + Twitter + 4chan  │  │
-│  └──────────────────────┘  └────────────────────────────┘  │
-│                                                              │
-│  ┌──────────────────────────────────────────────────────┐   │
-│  │              CLAUDE ANALYST                           │   │
-│  │  Interprets all signals → Natural language analysis   │   │
-│  └──────────────────────────────────────────────────────┘   │
+│  ┌───────────────────────▼───────────┐  ┌────────────────┐  │
+│  │ FEATURE ENGINE (13 price features)│  │  BACKTESTERS   │  │
+│  └───────────────────────┬───────────┘  └────────────────┘  │
+│  ┌───────────────────────▼───────────┐                      │
+│  │ MARKET DATA (Yahoo Finance)       │                      │
+│  └───────────────────────────────────┘                      │
+│  ┌───────────────────────────────────┐                      │
+│  │ SENTIMENT SCRAPER                 │──┐                   │
+│  │ Reddit + X + 4chan, VADER scoring │  │                   │
+│  └───────────────────────────────────┘  ▼                   │
+│  ┌───────────────────────────────────────────────────────┐  │
+│  │ CLAUDE ANALYST: model results + sentiment + risk      │  │
+│  │                  → written analysis and chat          │  │
+│  └───────────────────────────────────────────────────────┘  │
 └──────────────────────────────────────────────────────────────┘
 ```
 
-## Quick Start Guide
+## Quick Start
 
 ### Prerequisites
 
-- **Python 3.10+** → https://www.python.org/downloads/
-- **Node.js 18+** → https://nodejs.org/
-- Both must be installed and in your PATH
+- **Python 3.10+** from https://www.python.org/downloads/ (tick "Add to PATH")
+- **Node.js 18+** from https://nodejs.org/
 
-### Step 1 — Clone & Setup Backend
+### 1. Backend
 
 ```bash
-# Navigate to the backend folder
-cd backend
-
-# Create a virtual environment (recommended)
+cd nexus-ai/backend
 python -m venv venv
 
 # Activate it:
-# Windows PowerShell:
-.\venv\Scripts\Activate.ps1
-# Windows CMD:
-.\venv\Scripts\activate.bat
-# Mac/Linux:
-source venv/bin/activate
+.\venv\Scripts\Activate.ps1      # Windows PowerShell
+.\venv\Scripts\activate.bat      # Windows CMD
+source venv/bin/activate         # Mac/Linux
 
-# Install dependencies
 pip install -r requirements.txt
-```
-
-### Step 2 — Configure API Keys
-
-Copy the example env file and fill in your keys:
-
-```bash
-copy .env.example .env     # Windows
-cp .env.example .env        # Mac/Linux
-```
-
-Edit `.env` with your keys:
-
-```
-ANTHROPIC_API_KEY=sk-ant-...      # From console.anthropic.com
-REDDIT_CLIENT_ID=...               # From reddit.com/prefs/apps
-REDDIT_CLIENT_SECRET=...
-TWITTER_BEARER_TOKEN=...           # From developer.x.com
-```
-
-**Which keys are required?**
-- **Anthropic (Claude):** Needed for AI analysis & chat. Get it at https://console.anthropic.com
-- **Reddit:** Needed for Reddit sentiment. Free at https://www.reddit.com/prefs/apps (create "script" type app)
-- **Twitter/X:** Needed for Twitter sentiment. Apply at https://developer.x.com
-- **4chan:** No key needed — public API
-
-**You can start with ZERO keys** — the system works without them, just without sentiment/Claude features.
-
-### Step 3 — Start the Backend
-
-```bash
+copy .env.example .env           # Windows  (Mac/Linux: cp .env.example .env)
 python server.py
 ```
 
-The server starts at `http://localhost:8000`. You'll see:
-```
-══════════════════════════════════════════════════════
-  NEXUS•AI — Artificial Financial Intelligence Platform
-══════════════════════════════════════════════════════
-```
+The backend runs at http://127.0.0.1:8000, with interactive API docs at
+http://127.0.0.1:8000/docs.
 
-### Step 4 — Setup Frontend
+### 2. Frontend
 
-Open a NEW terminal (keep the backend running):
+In a second terminal:
 
 ```bash
-# If you already have the nexus-ai React app:
-cd nexus-ai
-npm install recharts lucide-react
-npm start
-
-# Or create fresh:
-npx create-react-app nexus-ai
-cd nexus-ai
-npm install recharts lucide-react
-# Copy the React artifact into src/App.js
-npm start
+cd nexus-ai/frontend
+npm install
+npm run dev
 ```
+
+Open http://localhost:3000.
+
+### 3. API keys (all optional)
+
+Edit `nexus-ai/backend/.env`:
+
+| Key | Needed for | Cost |
+|-----|-----------|------|
+| `ANTHROPIC_API_KEY` | Claude analysis and chat | Pay per use, https://console.anthropic.com |
+| `REDDIT_CLIENT_ID` / `REDDIT_CLIENT_SECRET` | Reddit sentiment | Free, https://www.reddit.com/prefs/apps ("script" app) |
+| `TWITTER_BEARER_TOKEN` | X sentiment | Paid: recent search needs X's Basic tier or higher |
+| *(none)* | 4chan /biz/ sentiment | Free public API |
+
+With no keys at all, market data, model training, predictions, backtests, risk
+metrics and 4chan sentiment all work. Claude analysis uses `claude-opus-5-5` by
+default; set `ANTHROPIC_MODEL` (for example `claude-sonnet-5-5`) to change it.
 
 ## API Endpoints
 
-Once the backend is running, you can use these endpoints:
-
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| `GET` | `/` | Server status |
-| `GET` | `/api/health` | Model & system health |
-| `GET` | `/api/market/{symbol}` | Fetch market data (e.g., `/api/market/SPY`) |
-| `POST` | `/api/train` | Train all ML models |
-| `POST` | `/api/predict` | Get model predictions |
-| `POST` | `/api/sentiment/scrape` | Trigger sentiment scrape |
-| `GET` | `/api/sentiment` | Get cached sentiment data |
-| `POST` | `/api/analyze` | Get Claude's full analysis |
-| `POST` | `/api/chat` | Chat with Claude about markets |
-| `GET` | `/api/risk` | Calculate risk metrics |
+| `GET` | `/api/health` | Model status, out-of-sample scores, training period |
+| `GET` | `/api/market/{symbol}` | Market data from Yahoo Finance |
+| `POST` | `/api/train` | Train all models (runs in the background) |
+| `POST` | `/api/predict` | Next-session predictions from every model |
+| `POST` | `/api/backtest` | Backtest a model on sessions after its training data |
+| `GET` | `/api/risk` | VaR, CVaR, volatility, skew, kurtosis, normality tests |
+| `POST` | `/api/sentiment/scrape` | Scrape Reddit, X and 4chan |
+| `GET` | `/api/sentiment` | Latest sentiment, with per-source status |
+| `POST` | `/api/analyze` | Claude's written analysis |
+| `POST` | `/api/chat` | Chat with Claude about the current results |
+| `GET`/`POST` | `/api/igon/*` | Igon value screener endpoints |
 
-### Example: Train & Predict
+Example:
 
 ```bash
-# Train models on 2 years of SPY data
-curl -X POST http://localhost:8000/api/train \
-  -H "Content-Type: application/json" \
-  -d '{"symbol": "SPY", "period": "2y", "epochs_dnn": 50}'
-
-# Wait for training to complete, then predict
-curl -X POST http://localhost:8000/api/predict \
-  -H "Content-Type: application/json" \
-  -d '{"symbol": "SPY"}'
-
-# Scrape sentiment
-curl -X POST http://localhost:8000/api/sentiment/scrape
-
-# Get Claude's analysis
-curl -X POST http://localhost:8000/api/analyze
-
-# Chat
-curl -X POST http://localhost:8000/api/chat \
-  -H "Content-Type: application/json" \
-  -d '{"message": "What does the sentiment on Reddit suggest about NVDA?"}'
+curl -X POST http://127.0.0.1:8000/api/train -H "Content-Type: application/json" \
+  -d '{"symbol": "SPY", "period": "2y"}'
+curl http://127.0.0.1:8000/api/health          # repeat until training.status is "complete"
+curl -X POST http://127.0.0.1:8000/api/backtest -H "Content-Type: application/json" \
+  -d '{"symbol": "SPY", "model": "dnn", "mode": "event"}'
 ```
 
-You can also open `http://localhost:8000/docs` in your browser to see the
-interactive Swagger API documentation that FastAPI generates automatically.
+## How It Works
 
-## How It All Works
+### Features and labels
+The feature engine computes 13 features from daily OHLCV data: today's and the
+previous four daily log returns, SMA-20, SMA-50 and EMA-12 relative to the close,
+20-day volatility, RSI, MACD, volume ratio and ATR. Each row's features use data
+up to that day's close, and its label is whether the **next** session closed higher.
 
-### 1. Data Pipeline
-- **Yahoo Finance** provides OHLCV (Open/High/Low/Close/Volume) data
-- **Feature Engine** computes 14 features: lagged returns, SMA, EMA, RSI, MACD, ATR, volatility, volume ratio, and social sentiment score
-- Sentiment score from Reddit/Twitter/4chan is injected as a feature
+Social sentiment is not a model input. The scraper produces one current reading,
+not a history aligned with past prices, so as a feature it would be a constant the
+models cannot learn from. Sentiment goes to the Claude analyst instead.
 
-### 2. ML Models (from the book)
-- **DNN Predictor**: 3-layer Dense network (64→64→32→1) with dropout, predicts direction (up/down)
-- **RNN Sequencer**: 2-layer LSTM (64→32→1), uses 20-step sequences to capture temporal patterns
-- **DQL Agent**: Deep Q-Learning with experience replay buffer (2000), epsilon-greedy exploration (1.0→0.01), 3 actions (BUY/HOLD/SELL)
-- **Ensemble**: Weighted average of all models, weights adjusted by accuracy
+### Models
+- **DNN**: Dense(64) → Dense(64) → Dense(32) → Dense(1), with dropout
+- **LSTM**: LSTM(64) → LSTM(32) → Dense(1) over 20-session windows
+- **DQL agent**: deep Q-learning with experience replay and epsilon-greedy
+  exploration; actions BUY / HOLD / SELL
+- **Ensemble**: a weighted average of the three. A model earns weight only if
+  it beats its baseline with statistical significance (below); otherwise the
+  weights are equal and every ensemble signal carries a no-skill warning.
 
-### 3. Sentiment Intelligence
-- **Reddit**: Scrapes r/wallstreetbets, r/stocks, r/investing, r/cryptocurrency + 6 more
-- **Twitter/X**: Searches for financial keywords and ticker mentions
-- **4chan /biz/**: Scrapes the Business & Finance board for contrarian signals
-- **VADER** sentiment analysis enhanced with financial lexicon (moon=+2.5, crash=-3.0, etc.)
-- Posts are weighted by engagement (upvotes, likes, replies)
+### Evaluation methodology
+- **Chronological split**: models train on the first 80% of the period and are
+  scored on the remaining 20%, which they never see. The scaler is fit on the
+  training rows only.
+- **Baseline**: each accuracy is shown next to the accuracy of always
+  predicting the training period's majority direction.
+- **Significance**: a one-sided exact McNemar test compares each model with the
+  baseline on the same sessions. The UI reports an edge only when p < 0.05.
+- **Backtests** trade only sessions after the training cutoff, charge
+  transaction costs, and compare against buy-and-hold over the same sessions.
+  Event-mode stops and targets are checked at the daily close and filled at that
+  close, so a gap past a stop is booked at the real price.
+- **Leakage test**: on random-walk prices, where nothing is predictable, a model
+  trained on these features scores about 50% out of sample (see
+  `tests/test_features.py`).
 
-### 4. Claude Analysis
-- Receives ML signals, sentiment data, and risk metrics
-- Provides natural language interpretation
-- Interactive chat for follow-up questions
-- Acknowledges uncertainty and never gives financial advice
+### Sentiment
+- **Reddit**: hot posts and top comments from r/wallstreetbets, r/stocks,
+  r/investing, r/options and five more
+- **X**: recent-search API, financial keywords and tickers
+- **4chan /biz/**: public catalog and thread API
+- Scoring uses **VADER** (a sentiment lexicon) extended with financial terms such as
+  moon (+2.5) and crash (-3.0). Within each source, posts are weighted by engagement;
+  sources are then combined by post count.
+- Each scrape reports, per source, whether it returned posts, had no credentials,
+  or failed, and why.
+
+### Claude analysis
+The analyst sends the models' out-of-sample results, sentiment and risk metrics
+to Claude and returns a written analysis; chat answers follow-up questions. The
+prompt instructs Claude to treat models without a significant edge as no
+evidence. Failed API calls are reported as errors, never replaced by canned text.
+
+## Running the Tests
+
+```bash
+cd nexus-ai/backend
+pip install -r requirements-dev.txt
+python -m pytest
+```
+
+The suite runs offline (no network or API keys) and covers leakage,
+backtesting, model evaluation, the Claude integration and the sentiment scraper.
 
 ## Important Disclaimers
 
-⚠️ **This is an educational project.** It is NOT financial advice.
+⚠️ **This is an educational project. It is NOT financial advice.**
 
-- Past model performance does not predict future results
-- The ML models typically achieve 55-65% directional accuracy — barely above coin flip
-- Social sentiment is noisy and can be manipulated
-- Never trade real money based solely on these signals
-- Always consult qualified financial professionals
+- Next-day direction is hard to predict. On real markets, expect out-of-sample
+  accuracy close to the baseline; the app tells you when no model has a
+  significant edge.
+- Backtest results describe one historical period and do not predict future results.
+- Social sentiment is noisy and can be manipulated.
+- Never trade real money based on these signals. Consult a qualified professional.
 
 ## Troubleshooting
 
-**"npm is not recognized"** → Install Node.js from https://nodejs.org and restart your terminal
+**"npm is not recognized"**: install Node.js from https://nodejs.org and restart the terminal.
 
-**"python is not recognized"** → Install Python from https://python.org, check "Add to PATH" during install
+**"python is not recognized"**: install Python from https://python.org with "Add to PATH" ticked.
 
-**PowerShell blocks scripts** → Run: `Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned`
+**PowerShell blocks scripts**: run `Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned`.
 
-**TensorFlow GPU errors** → The CPU version works fine. Ignore GPU warnings.
+**TensorFlow GPU warnings**: harmless; the CPU build works.
 
-**Reddit API 403 error** → Your Reddit app credentials may be wrong. Double-check at reddit.com/prefs/apps
+**Reddit 401/403**: check the credentials at reddit.com/prefs/apps.
 
-**Twitter API 403 error** → You need "Elevated" access on the Twitter developer portal
+**X 403**: the free X tier does not include recent search; it needs Basic or higher.
+The Sentiment tab shows this on the X badge.
 
-**4chan rate limiting** → The scraper includes 1-second delays. If blocked, wait a few minutes.
+**4chan rate limiting**: the scraper pauses one second between threads. If blocked, wait a few minutes.
+
+**Claude errors**: the chat shows the exact cause (invalid key, rate limit, network).

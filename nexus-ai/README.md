@@ -15,8 +15,8 @@ FastAPI Backend (:8000)
   +-- DNN Predictor (Ch.7)    -- Dense(64) x3 with dropout
   +-- RNN Sequencer (Ch.8)    -- LSTM(64) + LSTM(32)
   +-- DQL Agent (Ch.9)        -- Deep Q-Learning, experience replay
-  +-- Ensemble Meta-Learner   -- Accuracy-weighted combination
-  +-- Feature Engine           -- 14 features: RSI, MACD, ATR, sentiment...
+  +-- Ensemble                 -- Weighted by statistically significant skill
+  +-- Feature Engine           -- 13 price features: returns, RSI, MACD, ATR...
   +-- Vectorized Backtester (Ch.10) -- Fast matrix-based strategy evaluation
   +-- Event Backtester (Ch.11)      -- Stop-loss, take-profit, trade log
   +-- Sentiment Scraper        -- Reddit + Twitter/X + 4chan /biz/
@@ -55,7 +55,7 @@ You can start with zero keys - ML models and market data work without any.
 
 - **Anthropic (Claude):** https://console.anthropic.com - for AI analysis and chat
 - **Reddit:** https://www.reddit.com/prefs/apps - for Reddit sentiment
-- **Twitter/X:** https://developer.x.com - for Twitter sentiment
+- **Twitter/X:** https://developer.x.com - for X sentiment (needs the paid Basic tier or higher)
 - **4chan:** No key needed - public API
 
 ## API Endpoints
@@ -83,8 +83,21 @@ You can start with zero keys - ML models and market data work without any.
 | IV | 10-12 | Vectorized + event-based backtesting in backtester.py |
 | V | 13-14 | Risk analysis, non-normality diagnostics |
 
+## Evaluation and Tests
+
+Models are scored out of sample against a majority-class baseline, with a
+McNemar significance test, and backtests trade only sessions after the
+training cutoff. See the repository README for the full methodology.
+
+```bash
+cd nexus-ai/backend
+pip install -r requirements-dev.txt
+python -m pytest
+```
+
 ## Disclaimer
 
 This is an educational project. NOT financial advice.
-ML models typically achieve 55-65% directional accuracy.
-Never trade real money based solely on these signals.
+Next-day direction is hard to predict: on real markets, expect out-of-sample
+accuracy close to the baseline. The app reports when no model has a
+significant edge. Never trade real money based on these signals.

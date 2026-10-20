@@ -815,4 +815,8 @@ async def igon_batch_screen(symbols: List[str] = ["TTE.PA", "SAF.PA", "PUB.PA", 
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8000))
-    uvicorn.run("server:app", host="0.0.0.0", port=port, reload=True)
+    # Local only by default. The API has no authentication, and /api/chat and
+    # /api/analyze spend Anthropic credits, so it should not be reachable from
+    # other machines unless HOST is set deliberately.
+    host = os.getenv("HOST", "127.0.0.1")
+    uvicorn.run("server:app", host=host, port=port, reload=True)
