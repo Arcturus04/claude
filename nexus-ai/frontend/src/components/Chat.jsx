@@ -31,10 +31,9 @@ export default function Chat() {
       const data = await api.chat(input);
       setMessages(prev => [...prev, { role: 'assistant', content: data.response }]);
     } catch (e) {
-      setMessages(prev => [...prev, {
-        role: 'assistant',
-        content: `Error: ${e.message}. Make sure ANTHROPIC_API_KEY is set in your .env file.`,
-      }]);
+      // The backend's message names the actual failure (bad key, rate
+      // limit, network...), so show it as-is rather than guessing a cause.
+      setMessages(prev => [...prev, { role: 'assistant', content: `Error: ${e.message}` }]);
     } finally {
       setLoading(false);
     }
@@ -44,9 +43,12 @@ export default function Chat() {
     setAnalysisLoading(true);
     try {
       const data = await api.analyze();
+      // Without an API key the backend returns a plain summary instead of
+      // Claude's analysis; label it so it is never mistaken for one.
+      const label = data.llm_used ? '' : '[Offline summary, not AI analysis]\n\n';
       setMessages(prev => [...prev,
         { role: 'user', content: '[Requested full market analysis]' },
-        { role: 'assistant', content: data.analysis },
+        { role: 'assistant', content: label + data.analysis },
       ]);
     } catch (e) {
       setMessages(prev => [...prev, {

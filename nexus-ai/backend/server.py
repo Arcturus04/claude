@@ -436,9 +436,34 @@ async def _scrape_sentiment_task():
 
 # ─── CLAUDE ANALYSIS ─────────────────────────────────────────
 
+def _claude_response(result, text_key: str) -> Dict:
+    """
+    Map an analyst result to HTTP.
+
+    A configured client whose call failed is an upstream error (502), not a
+    successful answer. Without a key the documented offline mode is returned
+    with llm_used=false so callers can tell it from Claude's output.
+    """
+    if result.error and state["claude"].configured and result.stop_reason != "refusal":
+        raise HTTPException(502, result.error)
+    return {
+        text_key: result.text or result.error or "",
+        "llm_used": result.llm_used,
+        "model": result.model,
+        "error": result.error,
+        "stop_reason": result.stop_reason,
+        "usage": result.usage,
+    }
+
+
 @app.post("/api/analyze")
-async def analyze():
-    """Get Claude's comprehensive market analysis."""
+def analyze():
+    """
+    Get Claude's market analysis.
+
+    A plain function so FastAPI runs it in a worker thread: the Claude call
+    can take tens of seconds and must not block other requests.
+    """
     if not state["claude"]:
         raise HTTPException(500, "Claude analyst not initialized")
 
@@ -454,12 +479,13 @@ async def analyze():
 
     model_signals = {}
     if state["trained"]:
-        # Re-use latest prediction logic
         model_signals = {
             "dnn": state["dnn"].get_status(),
             "rnn": state["rnn"].get_status(),
             "dql": state["dql"].get_status(),
-            "ensemble": {"weights": state["ensemble"].weights},
+            "ensemble": state["ensemble"].get_status(),
+            "trained_symbol": state["trained_symbol"],
+            "test_period": [_iso_date(d) for d in state["test_period"]] if state["test_period"] else None,
         }
 
     sentiment_data = state["sentiment_cache"] or {}
@@ -480,37 +506,48 @@ async def analyze():
             ), 2),
         })
 
-    analysis = state["claude"].analyze(
+    result = state["claude"].analyze(
         market_data, model_signals, sentiment_data, risk_metrics
     )
 
     return {
         "timestamp": datetime.now().isoformat(),
-        "analysis": analysis,
+        **_claude_response(result, "analysis"),
         "data_used": {
             "market_data": bool(market_data),
             "model_signals": bool(model_signals),
-            "sentiment": bool(sentiment_data),
-            "risk_metrics": bool(risk_metrics),
+            "sentiment": _sentiment_has_posts(),
+            "risk_metrics": state["features_df"] is not None,
         },
     }
 
 
 @app.post("/api/chat")
-async def chat(req: ChatRequest):
-    """Chat with Claude about market conditions."""
+def chat(req: ChatRequest):
+    """Chat with Claude about market conditions (runs in a worker thread)."""
+    if not req.message.strip():
+        raise HTTPException(400, "message must not be empty")
     context = {
         "trained": state["trained"],
+        "trained_symbol": state["trained_symbol"],
         "models": {
             "dnn": state["dnn"].get_status() if state["dnn"] else None,
             "rnn": state["rnn"].get_status() if state["rnn"] else None,
             "dql": state["dql"].get_status() if state["dql"] else None,
         },
-        "sentiment": state["sentiment_cache"].get("overall_sentiment") if state["sentiment_cache"] else None,
+        "ensemble": state["ensemble"].get_status() if state["ensemble"] else None,
+        "sentiment": (
+            {
+                "overall": state["sentiment_cache"].get("overall_sentiment"),
+                "label": state["sentiment_cache"].get("sentiment_label"),
+                "posts": state["sentiment_cache"].get("total_posts"),
+            }
+            if _sentiment_has_posts() else "no posts collected"
+        ),
     }
 
-    response = state["claude"].chat(req.message, context)
-    return {"response": response}
+    result = state["claude"].chat(req.message, context)
+    return _claude_response(result, "response")
 
 
 # ─── RISK METRICS ─────────────────────────────────────────────
