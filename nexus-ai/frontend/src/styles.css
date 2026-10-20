@@ -256,6 +256,7 @@ body {
 .source-badge.reddit { background: rgba(255,69,0,0.15); color: #ff4500; }
 .source-badge.twitter { background: rgba(29,161,242,0.15); color: #1da1f2; }
 .source-badge.chan { background: rgba(128,128,0,0.15); color: #a0a000; }
+.source-badge.inactive { opacity: 0.45; text-decoration: line-through; }
 
 .sentiment-overview {
   background: var(--surface); border: 1px solid var(--border);

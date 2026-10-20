@@ -37,9 +37,26 @@ export default function Sentiment({ data, onScrape }) {
       </div>
 
       <div className="source-badges">
-        <span className="source-badge reddit">Reddit (WSB, stocks, investing +6 more)</span>
-        <span className="source-badge twitter">Twitter/X (financial tweets)</span>
-        <span className="source-badge chan">4chan /biz/ (contrarian signals)</span>
+        {[
+          ['reddit', 'reddit', 'Reddit (WSB, stocks, investing +6 more)'],
+          ['twitter', 'twitter', 'Twitter/X (financial tweets)'],
+          ['4chan', 'chan', '4chan /biz/ (contrarian signals)'],
+        ].map(([key, cls, label]) => {
+          // Each badge says what that source actually returned on the last
+          // scrape, so a source with no data never looks like it contributed.
+          const s = data?.source_status?.[key];
+          const note = !s ? '' :
+            s.status === 'ok' ? ` - ${s.posts} posts` :
+            s.status === 'no_credentials' ? ' - no API key' :
+            s.status === 'failed' ? ' - failed' :
+            s.status === 'empty' ? ' - 0 posts' : '';
+          return (
+            <span key={key} className={`source-badge ${cls} ${s && s.status !== 'ok' ? 'inactive' : ''}`}
+              title={s?.error || ''}>
+              {label}{note}
+            </span>
+          );
+        })}
       </div>
 
       {data && data.total_posts > 0 ? (
@@ -162,9 +179,13 @@ export default function Sentiment({ data, onScrape }) {
         </>
       ) : (
         <div className="empty-state">
-          <p>No sentiment data yet. Click "Scrape All Sources" to gather social media sentiment.</p>
+          <p>
+            {data?.sentiment_label === 'NO_DATA'
+              ? 'The last scrape collected no posts. Hover a source above for the reason.'
+              : 'No sentiment data yet. Click "Scrape All Sources" to gather social media sentiment.'}
+          </p>
           <p className="muted">
-            Requires API keys for Reddit and Twitter. 4chan works without keys.
+            Reddit needs free API keys; X needs a paid API tier. 4chan works without keys.
           </p>
         </div>
       )}

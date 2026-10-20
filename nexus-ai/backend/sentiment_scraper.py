@@ -7,6 +7,7 @@
 
 import os
 import re
+import html
 import json
 import time
 import logging
@@ -53,9 +54,22 @@ class SentimentScraper:
         "earnings", "fed", "inflation", "recession", "ath", "btfd",
         "breakout", "support", "resistance", "volume", "whale",
     ]
+    # Whole-word match, allowing simple inflections (bulls, bullish, dips,
+    # shorting). Plain substring matching let "weather" and "death" pass via
+    # "ath", "belong" via "long", "diploma" via "dip" and "bulletin" via
+    # "bull", scoring everyday text as market sentiment.
+    FINANCIAL_PATTERN = re.compile(
+        r"\b(?:" + "|".join(re.escape(k) for k in FINANCIAL_KEYWORDS) + r")"
+        r"(?:s|es|d|ed|ing|ish)?\b",
+        re.IGNORECASE,
+    )
+    SOURCES = ("reddit", "twitter", "4chan")
 
     def __init__(self):
         self.vader = SentimentIntensityAnalyzer()
+        self.source_status: Dict[str, Dict] = {
+            s: {"status": "not_run", "posts": 0, "error": None} for s in self.SOURCES
+        }
 
         # ─── Add custom financial lexicon to VADER ───
         financial_lexicon = {
@@ -114,8 +128,29 @@ class SentimentScraper:
 
     def is_financial(self, text: str) -> bool:
         """Check if text contains financial discussion."""
-        text_lower = text.lower()
-        return any(kw in text_lower for kw in self.FINANCIAL_KEYWORDS) or bool(self.TICKER_PATTERN.search(text))
+        return bool(self.FINANCIAL_PATTERN.search(text) or self.TICKER_PATTERN.search(text))
+
+    @staticmethod
+    def clean_html(raw: str) -> str:
+        """
+        Turn 4chan comment HTML into plain text.
+
+        Entities are decoded, including numeric ones: "don&#039;t" must reach
+        VADER as "don't", or its negation handling never sees the negation.
+        """
+        text = re.sub(r"<br\s*/?>", " ", raw or "")
+        text = re.sub(r"<[^>]+>", " ", text)
+        text = html.unescape(text)
+        return re.sub(r"\s+", " ", text).strip()
+
+    def _set_status(self, source: str, status: str, posts: int = 0,
+                    error: Optional[str] = None) -> None:
+        """Record why a source did or did not return posts.
+
+        An empty result can mean no credentials, a failed request or simply
+        no matching posts; callers need to tell those apart.
+        """
+        self.source_status[source] = {"status": status, "posts": posts, "error": error}
 
     # ═══════════════════════════════════════════════════════════
     #  REDDIT SCRAPER
@@ -129,19 +164,26 @@ class SentimentScraper:
         """
         if not self.reddit:
             logger.warning("Reddit client not available")
+            self._set_status("reddit", "no_credentials",
+                             error="Set REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET")
             return []
 
         posts = []
+        failures = []
         subreddits = [
             "wallstreetbets", "stocks", "investing",
             "options", "cryptocurrency", "forex",
             "stockmarket", "pennystocks", "thetagang",
         ]
+        # At least one submission per subreddit; plain floor division gave 0
+        # (and silently no posts) for any limit under the subreddit count.
+        per_sub = max(1, limit // len(subreddits))
 
         for sub_name in subreddits:
+            before = len(posts)
             try:
                 subreddit = self.reddit.subreddit(sub_name)
-                for submission in subreddit.hot(limit=limit // len(subreddits)):
+                for submission in subreddit.hot(limit=per_sub):
                     full_text = f"{submission.title} {submission.selftext}"
 
                     if not self.is_financial(full_text):
@@ -179,11 +221,17 @@ class SentimentScraper:
                                 url=f"https://reddit.com{comment.permalink}",
                             ))
 
-                logger.info(f"Scraped {sub_name}: found {len(posts)} financial posts")
+                logger.info(f"Scraped r/{sub_name}: {len(posts) - before} financial posts")
 
             except Exception as e:
                 logger.error(f"Error scraping r/{sub_name}: {e}")
+                failures.append(f"r/{sub_name}: {e}")
 
+        if failures and not posts:
+            self._set_status("reddit", "failed", error="; ".join(failures[:3]))
+        else:
+            self._set_status("reddit", "ok" if posts else "empty", posts=len(posts),
+                             error="; ".join(failures[:3]) or None)
         return posts
 
     # ═══════════════════════════════════════════════════════════
@@ -198,6 +246,8 @@ class SentimentScraper:
         """
         if not self.twitter_token:
             logger.warning("Twitter token not available")
+            self._set_status("twitter", "no_credentials",
+                             error="Set TWITTER_BEARER_TOKEN (X API Basic tier or higher)")
             return []
 
         posts = []
@@ -206,12 +256,22 @@ class SentimentScraper:
 
         params = {
             "query": f"({query}) lang:en -is:retweet",
-            "max_results": min(limit, 100),
+            # X accepts 10-100 here; anything below 10 is a 400 error.
+            "max_results": max(10, min(limit, 100)),
             "tweet.fields": "created_at,public_metrics,author_id",
         }
 
         try:
-            response = requests.get(url, headers=headers, params=params)
+            response = requests.get(url, headers=headers, params=params, timeout=10)
+            if response.status_code in (401, 403, 429):
+                reason = {
+                    401: "X rejected the bearer token (401)",
+                    403: "X returned 403: recent search requires the paid Basic tier or higher",
+                    429: "X rate limit reached (429)",
+                }[response.status_code]
+                logger.error(f"Twitter scraping error: {reason}")
+                self._set_status("twitter", "failed", error=reason)
+                return []
             response.raise_for_status()
             data = response.json()
 
@@ -239,9 +299,11 @@ class SentimentScraper:
                 ))
 
             logger.info(f"Scraped Twitter: found {len(posts)} financial tweets")
+            self._set_status("twitter", "ok" if posts else "empty", posts=len(posts))
 
         except Exception as e:
             logger.error(f"Twitter scraping error: {e}")
+            self._set_status("twitter", "failed", error=str(e))
 
         return posts
 
@@ -270,9 +332,7 @@ class SentimentScraper:
                     # Filter for financial discussion threads
                     subject = thread.get("sub", "")
                     comment = thread.get("com", "")
-                    full_text = f"{subject} {comment}"
-                    # Remove HTML tags
-                    full_text = re.sub(r'<[^>]+>', ' ', full_text)
+                    full_text = self.clean_html(f"{subject} {comment}")
 
                     if self.is_financial(full_text):
                         thread_ids.append(thread["no"])
@@ -291,11 +351,7 @@ class SentimentScraper:
                     thread_data = thread_resp.json()
 
                     for post in thread_data.get("posts", [])[:10]:
-                        comment = post.get("com", "")
-                        # Strip HTML
-                        comment = re.sub(r'<[^>]+>', ' ', comment)
-                        comment = re.sub(r'&[a-z]+;', ' ', comment)
-                        comment = comment.strip()
+                        comment = self.clean_html(post.get("com", ""))
 
                         if not comment or len(comment) < 20:
                             continue
@@ -320,9 +376,11 @@ class SentimentScraper:
                     logger.error(f"Error scraping 4chan thread {thread_id}: {e}")
 
             logger.info(f"Scraped 4chan /biz/: found {len(posts)} financial posts")
+            self._set_status("4chan", "ok" if posts else "empty", posts=len(posts))
 
         except Exception as e:
             logger.error(f"4chan catalog error: {e}")
+            self._set_status("4chan", "failed", error=str(e))
 
         return posts
 
@@ -343,18 +401,21 @@ class SentimentScraper:
         all_posts = reddit_posts + twitter_posts + chan_posts
 
         if not all_posts:
+            # No posts is "no data", not a neutral market: no score is given.
             return {
                 "timestamp": datetime.now().isoformat(),
                 "total_posts": 0,
-                "overall_sentiment": 0.0,
+                "overall_sentiment": None,
+                "sentiment_label": "NO_DATA",
                 "sources": {},
+                "source_status": dict(self.source_status),
                 "top_tickers": {},
                 "posts": [],
             }
 
         # Aggregate by source
         source_sentiments = {}
-        for source in ["reddit", "twitter", "4chan"]:
+        for source in self.SOURCES:
             source_posts = [p for p in all_posts if p.source == source]
             if source_posts:
                 # Weight by engagement score
@@ -393,8 +454,13 @@ class SentimentScraper:
                 "bullish_pct": round(len([s for s in sentiments if s > 0.05]) / len(sentiments) * 100, 1),
             }
 
-        # Overall weighted sentiment
-        overall = sum(p.sentiment for p in all_posts) / len(all_posts)
+        # Overall sentiment: each source's engagement-weighted average, combined
+        # across sources by post count. Engagement is only comparable within a
+        # source (Reddit upvotes vs 4chan reply counts), and an unweighted mean
+        # over all posts could disagree in sign with every per-source figure.
+        overall = sum(
+            stats["avg_sentiment"] * stats["count"] for stats in source_sentiments.values()
+        ) / len(all_posts)
 
         result = {
             "timestamp": datetime.now().isoformat(),
@@ -402,6 +468,7 @@ class SentimentScraper:
             "overall_sentiment": round(overall, 4),
             "sentiment_label": "BULLISH" if overall > 0.1 else "BEARISH" if overall < -0.1 else "NEUTRAL",
             "sources": source_sentiments,
+            "source_status": dict(self.source_status),
             "top_tickers": top_tickers,
             "posts": [asdict(p) for p in sorted(all_posts, key=lambda x: -abs(x.sentiment))[:50]],
         }

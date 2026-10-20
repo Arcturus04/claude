@@ -423,8 +423,12 @@ async def scrape_sentiment(background_tasks: BackgroundTasks):
     return {"status": "scraping_started", "message": "Sentiment scrape initiated."}
 
 
-async def _scrape_sentiment_task():
-    """Background sentiment scraping."""
+def _scrape_sentiment_task():
+    """
+    Background sentiment scraping, in a worker thread: the scrape makes many
+    network calls and pauses between 4chan requests, which as a coroutine
+    blocked every other request until it finished.
+    """
     try:
         result = state["scraper"].scrape_all(limit_per_source=50)
         state["sentiment_cache"] = result
