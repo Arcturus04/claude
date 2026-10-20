@@ -289,16 +289,17 @@ def _train_models_task(req: TrainRequest):
         dql = state["dql"]
         prices = labelled["Close"].values
         dql.train_on_data(X_train, prices[:split], episodes=req.episodes_dql)
-        dql_eval = dql.evaluate(X_test, prices[split:])
+        dql_eval = dql.evaluate(X_test, prices[split:], majority_up=float(np.mean(y_train)) >= 0.5)
         dql.accuracy = dql_eval["hit_rate"]
         dql.baseline_accuracy = dql_eval["baseline"]
+        dql.p_value = dql_eval["p_value"]
         dql.coverage = dql_eval["coverage"]
 
-        # ─── Weight the ensemble by out-of-sample skill ───
+        # ─── Weight the ensemble by significant out-of-sample skill ───
         state["ensemble"].update_weights({
-            "dnn": (dnn.accuracy, dnn.baseline_accuracy),
-            "rnn": (rnn.accuracy, rnn.baseline_accuracy),
-            "dql": (dql.accuracy, dql.baseline_accuracy),
+            "dnn": (dnn.accuracy, dnn.baseline_accuracy, dnn.p_value),
+            "rnn": (rnn.accuracy, rnn.baseline_accuracy, rnn.p_value),
+            "dql": (dql.accuracy, dql.baseline_accuracy, dql.p_value),
         })
 
         state["trained_symbol"] = req.symbol

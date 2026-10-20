@@ -38,6 +38,7 @@ def test_health_reports_out_of_sample_metrics_with_baselines(trained):
         m = health["models"][name]
         assert m["status"] == "active"
         assert m["accuracy"] is not None and m["baseline_accuracy"] is not None
+        assert 0.0 <= m["p_value"] <= 1.0 and isinstance(m["significant"], bool)
         assert m["input_features"] == len(health["training"]["features"])
     dql = health["models"]["dql"]
     assert dql["status"] == "active"

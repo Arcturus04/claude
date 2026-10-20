@@ -126,6 +126,7 @@ body {
 }
 .metric-label { font-size: 0.75rem; color: var(--text-muted); text-transform: uppercase; margin-bottom: 4px; }
 .metric-value { font-size: 1.4rem; font-weight: 700; }
+.metric-sub { display: block; font-size: 0.75rem; color: var(--text-muted); margin-top: 2px; }
 .green { color: var(--green); }
 .red { color: var(--red); }
 
@@ -182,8 +183,8 @@ body {
   margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border);
 }
 .model-metric { text-align: center; }
-.model-metric .metric-label { font-size: 0.7rem; }
-.model-metric .metric-value { font-size: 1rem; font-weight: 600; }
+.model-metric .metric-label { display: block; font-size: 0.7rem; }
+.model-metric .metric-value { display: block; font-size: 1rem; font-weight: 600; }
 .model-extra {
   display: flex; gap: 12px; font-size: 0.75rem; color: var(--text-muted);
   margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--border);
@@ -332,6 +333,14 @@ body {
 .trade-symbol { width: 40px; }
 .trade-price { flex: 1; }
 .trade-pnl { font-weight: 600; }
+/* Backtest trades carry a date range and an exit reason, wider than live signals. */
+.trade-entry.backtest .trade-time { width: 170px; white-space: nowrap; }
+.trade-entry.backtest .trade-action { width: 48px; }
+.trade-entry.backtest .trade-price { white-space: nowrap; }
+.trade-entry.backtest .trade-reason {
+  width: 112px; white-space: nowrap; font-size: 0.7rem; color: var(--text-muted);
+}
+.trade-entry.backtest .trade-pnl { width: 64px; text-align: right; white-space: nowrap; }
 .empty-chart {
   display: flex; align-items: center; justify-content: center;
   height: 300px; color: var(--text-muted);

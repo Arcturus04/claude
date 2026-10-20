@@ -118,7 +118,10 @@ export default function Dashboard({ marketData, prediction, health, training, on
                   <span className="status-name">{model?.name || key.toUpperCase()}</span>
                   <span className="status-detail">
                     {model?.status === 'active'
-                      ? `${model.accuracy}% acc`
+                      ? (model.accuracy !== null && model.accuracy !== undefined
+                          ? `${model.accuracy}% vs ${model.baseline_accuracy}% base` +
+                            (model.significant ? ' (significant)' : '')
+                          : 'no calls')
                       : model?.status || 'untrained'}
                   </span>
                 </div>

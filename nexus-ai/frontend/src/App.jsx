@@ -60,13 +60,23 @@ export default function App() {
     setTraining(true);
     try {
       await api.train({ symbol, ...params });
-      // Poll health until trained
+      // Poll health until training completes or fails
       const poll = setInterval(async () => {
-        const h = await api.health();
+        let h;
+        try {
+          h = await api.health();
+        } catch (e) {
+          return; // transient; keep polling
+        }
         setHealth(h);
-        const allActive = h.models &&
-          Object.values(h.models).every(m => m && m.status === 'active');
-        if (allActive) {
+        const status = h.training?.status;
+        if (status === 'failed') {
+          clearInterval(poll);
+          setTraining(false);
+          setError(`Training failed: ${h.training.error}`);
+          return;
+        }
+        if (status === 'complete') {
           clearInterval(poll);
           setTraining(false);
           // Fetch predictions after training
@@ -193,8 +203,8 @@ export default function App() {
         )}
         {tab === 'bot' && (
           <TradingBot
-            prediction={prediction}
             health={health}
+            symbol={symbol}
           />
         )}
         {tab === 'chat' && (

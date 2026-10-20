@@ -82,7 +82,14 @@ def test_random_walk_is_not_predictable():
     assert 44 < np.mean(accs) < 56, accs
 
 
-def test_majority_baseline():
-    assert FeatureEngine.majority_baseline([1, 1, 1, 0]) == 75.0
-    assert FeatureEngine.majority_baseline([0, 0, 1, 1]) == 50.0
-    assert FeatureEngine.majority_baseline([]) == 0.0
+def test_majority_baseline_uses_the_training_majority():
+    # Training mostly up, so the naive forecast is "up" on every test day.
+    assert FeatureEngine.majority_baseline([1, 1, 1, 0], y_train=[1, 1, 0]) == 75.0
+    assert FeatureEngine.majority_baseline([], y_train=[1]) == 0.0
+
+
+def test_majority_baseline_has_no_hindsight():
+    # Training says "up"; a test period that went all down must score 0%,
+    # not the 100% that picking the test period's own majority would give.
+    assert FeatureEngine.majority_baseline([0, 0, 0, 0], y_train=[1, 1, 0]) == 0.0
+    assert FeatureEngine.majority_baseline([0, 0, 0, 0], y_train=[0, 0, 1]) == 100.0

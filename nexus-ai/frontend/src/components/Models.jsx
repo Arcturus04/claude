@@ -1,7 +1,43 @@
 import React from 'react';
 
+// Accuracy means little without the bar it has to clear: in a rising market,
+// always predicting "up" can score well above 50%. And beating that bar by a
+// few points over a few dozen sessions is usually luck, so a model is shown
+// as having an edge only when a significance test says so.
+function AccuracyMetric({ model, isDql }) {
+  const { accuracy, baseline_accuracy: baseline, coverage, p_value: p, significant } = model;
+  if (accuracy === null || accuracy === undefined) {
+    return (
+      <div className="model-metric">
+        <span className="metric-label">{isDql ? 'Hit Rate' : 'Accuracy'}</span>
+        <span className="metric-value">{isDql ? 'No BUY/SELL calls' : 'n/a'}</span>
+      </div>
+    );
+  }
+  return (
+    <div className="model-metric">
+      <span className="metric-label">
+        {isDql ? 'Hit Rate (out-of-sample)' : 'Accuracy (out-of-sample)'}
+      </span>
+      <span className={`metric-value ${significant ? 'green' : ''}`}>{accuracy}%</span>
+      {baseline !== null && baseline !== undefined && (
+        <span className="metric-sub">vs {baseline}% baseline</span>
+      )}
+      {p !== null && p !== undefined && (
+        <span className="metric-sub">
+          {significant ? `edge is significant (p = ${p})` : `no significant edge (p = ${p})`}
+        </span>
+      )}
+      {isDql && coverage !== null && coverage !== undefined && (
+        <span className="metric-sub">calls on {coverage}% of sessions</span>
+      )}
+    </div>
+  );
+}
+
 export default function Models({ health, prediction, training, onTrain }) {
   const models = health?.models || {};
+  const trainingInfo = health?.training;
 
   const modelCards = [
     {
@@ -40,6 +76,17 @@ export default function Models({ health, prediction, training, onTrain }) {
         </button>
       </div>
 
+      {trainingInfo?.status === 'failed' && (
+        <div className="error-banner">Training failed: {trainingInfo.error}</div>
+      )}
+      {trainingInfo?.status === 'complete' && trainingInfo.test_period && (
+        <p className="muted">
+          Trained on {trainingInfo.symbol} up to {trainingInfo.train_end_date}. Accuracy is
+          measured on {trainingInfo.test_period[0]} to {trainingInfo.test_period[1]}, a period
+          the models never saw. Each model predicts the direction of the next session.
+        </p>
+      )}
+
       <div className="model-grid">
         {modelCards.map(card => {
           const model = models[card.key];
@@ -66,10 +113,7 @@ export default function Models({ health, prediction, training, onTrain }) {
               {isActive && (
                 <>
                   <div className="model-metrics">
-                    <div className="model-metric">
-                      <span className="metric-label">Accuracy</span>
-                      <span className="metric-value">{model.accuracy}%</span>
-                    </div>
+                    <AccuracyMetric model={model} isDql={card.key === 'dql'} />
                     {pred && (
                       <>
                         <div className="model-metric">
@@ -94,7 +138,7 @@ export default function Models({ health, prediction, training, onTrain }) {
                     <div className="model-extra">
                       <span>Epsilon: {model.epsilon}</span>
                       <span>Memory: {model.memory_size} experiences</span>
-                      <span>Total Reward: {model.total_reward}</span>
+                      <span>Best training reward (in-sample): {model.total_reward}</span>
                     </div>
                   )}
                 </>
@@ -106,7 +150,10 @@ export default function Models({ health, prediction, training, onTrain }) {
 
       {prediction?.ensemble && (
         <div className="ensemble-card">
-          <h3>Ensemble Meta-Learner</h3>
+          <h3>Ensemble (skill-weighted average)</h3>
+          {prediction.ensemble.no_skill_warning && (
+            <div className="warning-banner">{prediction.ensemble.warning}</div>
+          )}
           <div className="ensemble-grid">
             <div className="ensemble-metric">
               <span className="label">Combined Signal</span>

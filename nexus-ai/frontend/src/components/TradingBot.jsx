@@ -1,158 +1,247 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip,
   ResponsiveContainer, Legend,
 } from 'recharts';
 import { api } from '../api';
 
-export default function TradingBot({ prediction, health }) {
-  const [deployed, setDeployed] = useState(false);
-  const [trades, setTrades] = useState([]);
-  const [pnlHistory, setPnlHistory] = useState([]);
-  const [cumulativePnl, setCumulativePnl] = useState(0);
-  const intervalRef = useRef(null);
+// Every number on this page comes from the backend. Strategy performance is
+// an out-of-sample backtest: only sessions after the training cutoff are
+// traded, against a buy-and-hold benchmark over the same sessions.
+
+const pct = (v) => (v === null || v === undefined ? 'n/a' : `${v}%`);
+const num = (v) => (v === null || v === undefined ? 'n/a' : v);
+const money = (v) => (v === null || v === undefined ? 'n/a' : `$${Number(v).toLocaleString()}`);
+
+function BacktestMetrics({ result }) {
+  const isEvent = result.mode === 'event';
+  const rows = isEvent
+    ? [
+        ['Strategy return', pct(result.total_return)],
+        ['Buy & hold return', pct(result.total_return_market)],
+        ['Max drawdown', pct(result.max_drawdown)],
+        ['Trades', num(result.total_trades)],
+        ['Win rate', pct(result.win_rate)],
+        ['Profit factor', num(result.profit_factor)],
+        ['Payoff ratio', num(result.payoff_ratio)],
+        ['Stops / targets hit', `${result.stop_loss_hits} / ${result.take_profit_hits}`],
+        ['Transaction costs', money(result.transaction_costs_total)],
+      ]
+    : [
+        ['Strategy return', pct(result.total_return_strategy)],
+        ['Buy & hold return', pct(result.total_return_market)],
+        ['Out/under-performance', pct(result.outperformance)],
+        ['Sharpe ratio', num(result.sharpe_ratio)],
+        ['Sortino ratio', num(result.sortino_ratio)],
+        ['Max drawdown', pct(result.max_drawdown)],
+        ['Position changes', num(result.total_trades)],
+        ['In-market win rate', pct(result.win_rate)],
+        ['Transaction costs', money(result.transaction_costs_total)],
+      ];
+  return (
+    <div className="params-grid">
+      {rows.map(([label, value]) => (
+        <div key={label} className="param-card">
+          <span className="param-name">{label}</span>
+          <span className="param-value">{value}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+export default function TradingBot({ health, symbol = 'SPY' }) {
+  const [model, setModel] = useState('dnn');
+  const [mode, setMode] = useState('vectorized');
+  const [result, setResult] = useState(null);
+  const [running, setRunning] = useState(false);
+  const [error, setError] = useState(null);
+
+  const [monitoring, setMonitoring] = useState(false);
+  const [signalLog, setSignalLog] = useState([]);
 
   const dqlStatus = health?.models?.dql;
-  const dqlPred = prediction?.models?.dql;
-  const isReady = dqlStatus?.status === 'active';
+  const trainingInfo = health?.training;
+  const isReady = trainingInfo?.status === 'complete';
 
-  const params = {
-    gamma: 0.95,
-    epsilon: dqlStatus?.epsilon || 0.01,
-    epsilon_decay: 0.995,
-    batch_size: 32,
-    stop_loss: '1.75%',
-    take_profit: '1.85%',
+  const runBacktest = async () => {
+    setRunning(true);
+    setError(null);
+    try {
+      setResult(await api.backtest({ symbol, model, mode }));
+    } catch (e) {
+      setResult(null);
+      setError(e.message);
+    } finally {
+      setRunning(false);
+    }
   };
 
+  // Live signal monitor: records what the agent would do now. It places no
+  // orders and invents no profit; how a signal would have traded is what the
+  // backtest measures.
   useEffect(() => {
-    if (deployed && isReady) {
-      intervalRef.current = setInterval(async () => {
-        try {
-          const pred = await api.predict('SPY');
-          const dql = pred.models.dql;
-          const action = dql.action || 'HOLD';
-          const price = pred.current_price;
-          const pnl = action === 'HOLD' ? 0 :
-            (Math.random() - 0.42) * 80 * (action === 'BUY' ? 1 : -1);
-
-          const trade = {
-            time: new Date().toLocaleTimeString(),
-            action,
-            symbol: pred.symbol,
-            price,
-            pnl: Math.round(pnl * 100) / 100,
-            confidence: dql.confidence,
-          };
-
-          setTrades(prev => [trade, ...prev].slice(0, 50));
-          setCumulativePnl(prev => {
-            const newPnl = prev + pnl;
-            setPnlHistory(h => [...h, {
-              time: trade.time,
-              strategy: Math.round(newPnl * 100) / 100,
-              benchmark: Math.round((h.length + 1) * 2.5 * (Math.random() - 0.48) * 100) / 100,
-            }].slice(-50));
-            return newPnl;
-          });
-        } catch (e) {
-          console.error('Bot tick failed:', e);
-        }
-      }, 5000);
-    } else {
-      if (intervalRef.current) clearInterval(intervalRef.current);
-    }
-
-    return () => {
-      if (intervalRef.current) clearInterval(intervalRef.current);
+    if (!(monitoring && isReady)) return undefined;
+    const tick = async () => {
+      try {
+        const pred = await api.predict(symbol);
+        const dql = pred.models.dql;
+        setSignalLog(prev => [{
+          time: new Date().toLocaleTimeString(),
+          action: dql.action || 'HOLD',
+          symbol: pred.symbol,
+          price: pred.current_price,
+          confidence: dql.confidence,
+          ensemble: pred.ensemble?.signal,
+        }, ...prev].slice(0, 50));
+      } catch (e) {
+        setError(`Signal update failed: ${e.message}`);
+      }
     };
-  }, [deployed, isReady]);
+    tick();
+    const id = setInterval(tick, 60000);
+    return () => clearInterval(id);
+  }, [monitoring, isReady, symbol]);
+
+  const chartData = (result?.equity_curve || []).map(p => ({
+    date: p.date,
+    strategy: p.strategy,
+    market: p.market,
+  }));
+  const oos = result?.out_of_sample;
 
   return (
     <div className="bot-page">
       <div className="page-header">
         <h2>DQL Trading Agent</h2>
         <div className="bot-controls">
-          <span className={`pnl-display ${cumulativePnl >= 0 ? 'green' : 'red'}`}>
-            P&L: ${cumulativePnl.toFixed(2)}
-          </span>
           <button
-            className={`btn-${deployed ? 'danger' : 'success'}`}
-            onClick={() => setDeployed(!deployed)}
+            className={`btn-${monitoring ? 'danger' : 'success'}`}
+            onClick={() => setMonitoring(!monitoring)}
             disabled={!isReady}
           >
-            {deployed ? 'STOP BOT' : 'DEPLOY BOT'}
+            {monitoring ? 'STOP SIGNAL MONITOR' : 'START SIGNAL MONITOR'}
           </button>
         </div>
       </div>
 
       {!isReady && (
         <div className="warning-banner">
-          DQL Agent not trained. Go to AI Models tab and train all models first.
+          Models not trained. Go to the AI Models tab and train them first.
         </div>
       )}
+      {error && <div className="error-banner">{error}</div>}
 
-      <div className="bot-params">
-        <h3>Agent Hyperparameters (from Hilpisch Ch.9)</h3>
-        <div className="params-grid">
-          {Object.entries(params).map(([key, val]) => (
-            <div key={key} className="param-card">
-              <span className="param-name">
-                {key === 'gamma' ? 'Gamma (discount)' :
-                 key === 'epsilon' ? 'Epsilon (explore)' :
-                 key === 'epsilon_decay' ? 'Epsilon Decay' :
-                 key === 'batch_size' ? 'Batch Size' :
-                 key === 'stop_loss' ? 'Stop Loss' :
-                 key === 'take_profit' ? 'Take Profit' : key}
-              </span>
-              <span className="param-value">{val}</span>
-            </div>
-          ))}
-        </div>
-      </div>
-
-      <div className="two-col">
-        <div className="trade-log">
-          <h3>Trade Execution Log</h3>
-          <div className="log-scroll">
-            {trades.length > 0 ? trades.map((t, i) => (
-              <div key={i} className={`trade-entry ${t.action.toLowerCase()}`}>
-                <span className="trade-time">{t.time}</span>
-                <span className={`trade-action ${
-                  t.action === 'BUY' ? 'green' : t.action === 'SELL' ? 'red' : ''
-                }`}>{t.action}</span>
-                <span className="trade-symbol">{t.symbol}</span>
-                <span className="trade-price">${t.price}</span>
-                <span className={`trade-pnl ${t.pnl >= 0 ? 'green' : 'red'}`}>
-                  {t.pnl >= 0 ? '+' : ''}{t.pnl.toFixed(2)}
-                </span>
-              </div>
-            )) : (
-              <p className="muted">Deploy the bot to see trades</p>
-            )}
-          </div>
+      <div className="chart-section">
+        <h3>Out-of-Sample Backtest: {symbol}</h3>
+        <div className="bot-controls" style={{ marginBottom: 12 }}>
+          <select value={model} onChange={e => setModel(e.target.value)}>
+            <option value="dnn">DNN</option>
+            <option value="rnn">LSTM</option>
+            <option value="ensemble">Ensemble (DNN + DQL)</option>
+          </select>
+          <select value={mode} onChange={e => setMode(e.target.value)}>
+            <option value="vectorized">Vectorized (daily positions)</option>
+            <option value="event">Event-based (stops and targets)</option>
+          </select>
+          <button className="btn-primary" onClick={runBacktest} disabled={!isReady || running}>
+            {running ? 'Running...' : 'Run Backtest'}
+          </button>
         </div>
 
-        <div className="chart-section">
-          <h3>Strategy vs Benchmark</h3>
-          {pnlHistory.length > 0 ? (
+        {oos && (
+          <p className="muted">
+            Models trained on {oos.trained_symbol} up to {oos.train_end_date}. This backtest
+            trades only {oos.start} to {oos.end} ({oos.sessions} sessions), data the models never
+            saw, with transaction costs included. {oos.note}
+            {oos.trained_symbol && oos.trained_symbol.toUpperCase() !== symbol.toUpperCase() &&
+              ` Note: the models were trained on ${oos.trained_symbol}, not ${symbol}.`}
+          </p>
+        )}
+
+        {chartData.length > 0 ? (
+          <>
             <ResponsiveContainer width="100%" height={300}>
-              <LineChart data={pnlHistory}>
+              <LineChart data={chartData}>
                 <CartesianGrid strokeDasharray="3 3" stroke="#333" />
-                <XAxis dataKey="time" stroke="#888" tick={{ fontSize: 10 }} />
-                <YAxis stroke="#888" />
+                <XAxis dataKey="date" stroke="#888" tick={{ fontSize: 10 }} minTickGap={30} />
+                <YAxis stroke="#888" domain={['auto', 'auto']} />
                 <Tooltip
                   contentStyle={{ background: '#1a1a2e', border: '1px solid #333', color: '#fff' }}
                 />
                 <Legend />
                 <Line type="monotone" dataKey="strategy" stroke="#00d4ff"
-                  strokeWidth={2} dot={false} name="DQL Strategy" />
-                <Line type="monotone" dataKey="benchmark" stroke="#666"
-                  strokeWidth={1} strokeDasharray="5 5" dot={false} name="Benchmark" />
+                  strokeWidth={2} dot={false} name="Strategy" />
+                <Line type="monotone" dataKey="market" stroke="#888"
+                  strokeWidth={1} strokeDasharray="5 5" dot={false} name="Buy & hold" />
               </LineChart>
             </ResponsiveContainer>
+            <BacktestMetrics result={result} />
+          </>
+        ) : (
+          <div className="empty-chart">
+            {isReady ? 'Run a backtest to see out-of-sample performance' : 'Train the models first'}
+          </div>
+        )}
+      </div>
+
+      <div className="two-col">
+        <div className="trade-log">
+          <h3>{result?.mode === 'event' ? 'Backtest Trades (last 50)' : 'Signal Monitor'}</h3>
+          <div className="log-scroll">
+            {result?.mode === 'event' ? (
+              result.trades.length > 0 ? result.trades.map((t, i) => (
+                <div key={i} className={`trade-entry backtest ${t.direction === 'LONG' ? 'buy' : 'sell'}`}>
+                  <span className="trade-time">{t.entry_date} to {t.exit_date}</span>
+                  <span className={`trade-action ${t.direction === 'LONG' ? 'green' : 'red'}`}>
+                    {t.direction}
+                  </span>
+                  <span className="trade-price">${t.entry_price} to ${t.exit_price}</span>
+                  <span className="trade-reason">{t.exit_reason.replace(/_/g, ' ')}</span>
+                  <span className={`trade-pnl ${t.pnl >= 0 ? 'green' : 'red'}`}>
+                    {t.pnl >= 0 ? '+' : ''}{t.pnl.toFixed(2)}
+                  </span>
+                </div>
+              )) : <p className="muted">No trades in this period</p>
+            ) : signalLog.length > 0 ? signalLog.map((s, i) => (
+              <div key={i} className={`trade-entry ${s.action.toLowerCase()}`}>
+                <span className="trade-time">{s.time}</span>
+                <span className={`trade-action ${
+                  s.action === 'BUY' ? 'green' : s.action === 'SELL' ? 'red' : ''
+                }`}>{s.action}</span>
+                <span className="trade-symbol">{s.symbol}</span>
+                <span className="trade-price">${s.price}</span>
+                <span className="trade-pnl">conf {(s.confidence * 100).toFixed(0)}%</span>
+              </div>
+            )) : (
+              <p className="muted">
+                Start the signal monitor to log the agent's live signal once a minute. Signals
+                only: no orders are placed and no profit is computed.
+              </p>
+            )}
+          </div>
+        </div>
+
+        <div className="bot-params">
+          <h3>Agent Hyperparameters (from the trained model)</h3>
+          {dqlStatus ? (
+            <div className="params-grid">
+              {[
+                ['Gamma (discount)', dqlStatus.gamma],
+                ['Epsilon (explore)', dqlStatus.epsilon],
+                ['Epsilon Decay', dqlStatus.epsilon_decay],
+                ['Batch Size', dqlStatus.batch_size],
+                ['Input Features', dqlStatus.input_features],
+                ['Replay Memory', dqlStatus.memory_size],
+              ].map(([name, value]) => (
+                <div key={name} className="param-card">
+                  <span className="param-name">{name}</span>
+                  <span className="param-value">{num(value)}</span>
+                </div>
+              ))}
+            </div>
           ) : (
-            <div className="empty-chart">Deploy the bot to see performance</div>
+            <p className="muted">Backend not reachable.</p>
           )}
         </div>
       </div>
@@ -162,7 +251,7 @@ export default function TradingBot({ prediction, health }) {
         <div className="arch-diagram">
           <div className="arch-layer input">
             <span className="layer-name">Input</span>
-            <span className="layer-detail">14 features</span>
+            <span className="layer-detail">{num(dqlStatus?.input_features)} features</span>
           </div>
           <div className="arch-arrow">--</div>
           <div className="arch-layer hidden">

@@ -24,8 +24,48 @@ from tensorflow.keras.layers import Dense, Dropout, LSTM, GRU
 from tensorflow.keras.optimizers import Adam, RMSprop
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import accuracy_score
+from scipy.stats import binomtest
 
 logger = logging.getLogger(__name__)
+
+SIGNIFICANCE_LEVEL = 0.05
+
+
+def paired_skill_test(model_correct, baseline_correct) -> Optional[float]:
+    """
+    One-sided exact McNemar test: does the model beat the baseline on the
+    same sessions by more than chance?
+
+    Only sessions where exactly one of the two is right carry information.
+    If the model had no edge, it would win each of those like a coin flip.
+    Returns the p-value, or None when there is nothing to compare.
+
+    Daily direction is hard to predict, and a few points of accuracy over a
+    few dozen test sessions is well within noise; on random-walk prices a
+    model "beats" the baseline about half the time by luck alone.
+    """
+    model_correct = np.asarray(model_correct, dtype=bool)
+    baseline_correct = np.asarray(baseline_correct, dtype=bool)
+    if model_correct.size == 0:
+        return None
+    wins = int(np.sum(model_correct & ~baseline_correct))
+    losses = int(np.sum(~model_correct & baseline_correct))
+    if wins + losses == 0:
+        return 1.0
+    return float(binomtest(wins, wins + losses, 0.5, alternative="greater").pvalue)
+
+
+def skill_fields(accuracy: Optional[float], baseline: Optional[float],
+                 p_value: Optional[float]) -> Dict:
+    """Accuracy reported together with what it has to beat and whether it did."""
+    def r(v, nd=2):
+        return round(v, nd) if v is not None else None
+    return {
+        "accuracy": r(accuracy),
+        "baseline_accuracy": r(baseline),
+        "p_value": r(p_value, 4),
+        "significant": p_value is not None and p_value < SIGNIFICANCE_LEVEL,
+    }
 
 
 class FeatureEngine:
@@ -169,19 +209,24 @@ class FeatureEngine:
         return X_train, X_test, y_train, y_test
 
     @staticmethod
-    def majority_baseline(y_test) -> float:
+    def majority_baseline(y_test, y_train) -> float:
         """
-        Accuracy of always predicting the test set's most common direction.
+        Test accuracy of always predicting the training set's most common
+        direction (scikit-learn's DummyClassifier "most_frequent").
 
         A directional model is only skilful if it beats this. In a rising
         market "always up" can score well above 50%, so a raw accuracy figure
-        quoted without its baseline says little.
+        quoted without its baseline says little. The majority is taken from
+        the training data because that is all a forecaster could have known;
+        taking it from the test data would use hindsight, and on small test
+        sets it inflates the baseline (to ~55% on pure noise).
         """
-        y_test = np.asarray(y_test)
+        y_test, y_train = np.asarray(y_test), np.asarray(y_train)
         if len(y_test) == 0:
             return 0.0
-        up_share = float(np.mean(y_test))
-        return max(up_share, 1.0 - up_share) * 100
+        majority_up = len(y_train) == 0 or float(np.mean(y_train)) >= 0.5
+        hit = y_test == (1 if majority_up else 0)
+        return float(np.mean(hit) * 100)
 
 
 class DNNPredictor:
@@ -197,6 +242,7 @@ class DNNPredictor:
         self.history = None
         self.accuracy = 0.0
         self.baseline_accuracy = None
+        self.p_value = None
         self.trained = False
         self.name = "DNN Predictor"
 
@@ -230,11 +276,13 @@ class DNNPredictor:
         )
         y_pred = (self.model.predict(X_test, verbose=0) > 0.5).astype(int).flatten()
         self.accuracy = accuracy_score(y_test, y_pred) * 100
-        self.baseline_accuracy = FeatureEngine.majority_baseline(y_test)
+        self.baseline_accuracy = FeatureEngine.majority_baseline(y_test, y_train)
+        majority = 1 if np.mean(y_train) >= 0.5 else 0
+        self.p_value = paired_skill_test(y_pred == y_test, y_test == majority)
         self.trained = True
         logger.info(
             f"DNN out-of-sample accuracy: {self.accuracy:.2f}% "
-            f"(majority-class baseline {self.baseline_accuracy:.2f}%)"
+            f"(majority-class baseline {self.baseline_accuracy:.2f}%, p={self.p_value:.3f})"
         )
         return self.accuracy
 
@@ -249,10 +297,8 @@ class DNNPredictor:
         return {
             "name": self.name,
             "type": "Dense Neural Network",
-            "accuracy": round(self.accuracy, 2) if self.trained else None,
-            "baseline_accuracy": (
-                round(self.baseline_accuracy, 2) if self.baseline_accuracy is not None else None
-            ),
+            **skill_fields(self.accuracy if self.trained else None,
+                           self.baseline_accuracy, self.p_value),
             "status": "active" if self.trained else "untrained",
             "input_features": self.input_dim,
             "architecture": "Dense(64) → Dense(64) → Dense(32) → Dense(1)",
@@ -272,6 +318,7 @@ class RNNPredictor:
         self.model = self._build_model(n_features, hidden_units, learning_rate)
         self.accuracy = 0.0
         self.baseline_accuracy = None
+        self.p_value = None
         self.trained = False
         self.name = "RNN Sequencer"
 
@@ -335,11 +382,13 @@ class RNNPredictor:
         )
         y_pred = (self.model.predict(X_test_seq, verbose=0) > 0.5).astype(int).flatten()
         self.accuracy = accuracy_score(y_test_seq, y_pred) * 100
-        self.baseline_accuracy = FeatureEngine.majority_baseline(y_test_seq)
+        self.baseline_accuracy = FeatureEngine.majority_baseline(y_test_seq, y_train_seq)
+        majority = 1 if np.mean(y_train_seq) >= 0.5 else 0
+        self.p_value = paired_skill_test(y_pred == y_test_seq, y_test_seq == majority)
         self.trained = True
         logger.info(
             f"RNN out-of-sample accuracy: {self.accuracy:.2f}% "
-            f"(majority-class baseline {self.baseline_accuracy:.2f}%)"
+            f"(majority-class baseline {self.baseline_accuracy:.2f}%, p={self.p_value:.3f})"
         )
         return self.accuracy
 
@@ -374,10 +423,8 @@ class RNNPredictor:
         return {
             "name": self.name,
             "type": "LSTM Recurrent Neural Net",
-            "accuracy": round(self.accuracy, 2) if self.trained else None,
-            "baseline_accuracy": (
-                round(self.baseline_accuracy, 2) if self.baseline_accuracy is not None else None
-            ),
+            **skill_fields(self.accuracy if self.trained else None,
+                           self.baseline_accuracy, self.p_value),
             "status": "active" if self.trained else "untrained",
             "input_features": self.n_features,
             "architecture": f"LSTM(64, seq={self.sequence_length}) → LSTM(32) → Dense(1)",
@@ -406,6 +453,7 @@ class DQLAgent:
         self.model = self._build_model(state_dim, hidden_units, learning_rate)
         self.accuracy = None        # Out-of-sample directional hit rate
         self.baseline_accuracy = None
+        self.p_value = None
         self.coverage = None        # Share of test sessions with a BUY/SELL call
         self.total_reward = 0.0     # Best training-episode reward (in-sample)
         self.trained = False
@@ -480,7 +528,8 @@ class DQLAgent:
         if self.epsilon > self.epsilon_min:
             self.epsilon *= self.epsilon_decay
 
-    def evaluate(self, features: np.ndarray, prices: np.ndarray) -> Dict:
+    def evaluate(self, features: np.ndarray, prices: np.ndarray,
+                 majority_up: bool = True) -> Dict:
         """
         Out-of-sample score on data the agent did not train on.
 
@@ -488,8 +537,12 @@ class DQLAgent:
         if the next close is higher, a SELL if it is lower; HOLDs make no
         directional claim and are excluded, which is why coverage is reported
         alongside the hit rate.
+
+        majority_up is the training set's majority direction. The baseline is
+        the hit rate of always calling that direction on the same sessions.
         """
-        empty = {"hit_rate": None, "baseline": None, "coverage": 0.0, "calls": 0}
+        empty = {"hit_rate": None, "baseline": None, "p_value": None,
+                 "coverage": 0.0, "calls": 0}
         if len(features) < 2:
             return empty
         actions = self.greedy_actions(features[:-1])
@@ -499,11 +552,13 @@ class DQLAgent:
             return empty
         predicted = np.where(actions == 1, 1.0, -1.0)
         hits = (predicted == next_move) & called
-        # Baseline: always calling the majority direction on the same sessions.
-        up_share = float(np.mean(next_move[called] > 0))
+        # Baseline: always calling the training majority on the same sessions.
+        naive = 1.0 if majority_up else -1.0
+        naive_hits = next_move[called] == naive
         return {
             "hit_rate": float(hits.sum() / called.sum() * 100),
-            "baseline": max(up_share, 1.0 - up_share) * 100,
+            "baseline": float(np.mean(naive_hits) * 100),
+            "p_value": paired_skill_test(hits[called], naive_hits),
             "coverage": float(called.mean() * 100),
             "calls": int(called.sum()),
         }
@@ -591,11 +646,8 @@ class DQLAgent:
         return {
             "name": self.name,
             "type": "Deep Q-Learning",
-            "accuracy": round(self.accuracy, 2) if self.accuracy is not None else None,
+            **skill_fields(self.accuracy, self.baseline_accuracy, self.p_value),
             "accuracy_definition": "out-of-sample hit rate on BUY/SELL calls",
-            "baseline_accuracy": (
-                round(self.baseline_accuracy, 2) if self.baseline_accuracy is not None else None
-            ),
             "coverage": round(self.coverage, 2) if self.coverage is not None else None,
             "status": "active" if self.trained else "untrained",
             "input_features": self.state_dim,
@@ -613,11 +665,12 @@ class EnsemblePredictor:
     """
     Weighted average of the DNN, RNN and DQL signals.
 
-    This is a fixed weighting rule, not a learned stacking model. Each model's
-    weight is its out-of-sample accuracy in excess of the majority-class
-    baseline, so a model with no demonstrated skill gets no say. If no model
-    beats the baseline, the weights fall back to equal and every prediction
-    carries a warning saying so.
+    This is a fixed weighting rule, not a learned stacking model. A model
+    earns weight only if it beat its majority-class baseline out of sample
+    with statistical significance (one-sided McNemar test, p < 0.05); its
+    weight is then its accuracy in excess of that baseline. If no model
+    qualifies, the weights fall back to equal and every prediction carries a
+    warning saying the signal is not evidence of skill.
     """
 
     IGON_WEIGHT = 0.15
@@ -690,24 +743,29 @@ class EnsemblePredictor:
         }
         if self.no_skill:
             result["warning"] = (
-                "No model beat the majority-class baseline out of sample, so this "
-                "signal is not evidence of predictive skill."
+                "No model beat its majority-class baseline out of sample by more than "
+                "chance, so this signal is not evidence of predictive skill."
             )
         return result
 
-    def update_weights(self, scores: Dict[str, Tuple[Optional[float], Optional[float]]]):
+    def update_weights(self, scores: Dict[str, Tuple[Optional[float], Optional[float],
+                                                       Optional[float]]]):
         """
-        Weight each model by its out-of-sample accuracy above its own baseline.
+        Weight models by statistically significant out-of-sample skill.
 
-        scores maps "dnn" / "rnn" / "dql" to (accuracy, baseline) in percent.
-        Each baseline is the majority-class rate on the sessions that model was
-        scored on. None means the model made no scoreable calls. Models at or
-        below their baseline get zero weight.
+        scores maps "dnn" / "rnn" / "dql" to (accuracy, baseline, p_value),
+        accuracies in percent. None means the model made no scoreable calls.
+        A model gets weight equal to its excess over baseline only if that
+        excess is significant; otherwise it gets none.
         """
         self.skill = {}
         for k in ("dnn", "rnn", "dql"):
-            acc, base = scores.get(k, (None, None))
-            self.skill[k] = max(acc - base, 0.0) if acc is not None and base is not None else 0.0
+            acc, base, p = scores.get(k, (None, None, None))
+            significant = p is not None and p < SIGNIFICANCE_LEVEL
+            if acc is not None and base is not None and significant:
+                self.skill[k] = max(acc - base, 0.0)
+            else:
+                self.skill[k] = 0.0
         total = sum(self.skill.values())
         self.no_skill = total <= 0
         for k in self.skill:

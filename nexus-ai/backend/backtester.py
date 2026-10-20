@@ -302,10 +302,17 @@ class EventBacktester:
                 "fills": "stops and targets checked and filled at the daily close",
             },
             "trades": trades[-50:],  # Last 50 trades
+            # Same shape as the vectorized curve: strategy equity alongside a
+            # buy-and-hold benchmark over the same sessions.
             "equity_curve": [
-                {"date": dates[i] if i < len(dates) else dates[-1], "equity": round(float(e), 2)}
+                {
+                    "date": dates[i],
+                    "strategy": round(float(e), 2),
+                    "market": round(float(self.initial_capital * prices[i] / prices[0]), 2),
+                }
                 for i, e in enumerate(equity)
             ],
+            "total_return_market": round((prices[-1] / prices[0] - 1) * 100, 2),
         }
 
 
